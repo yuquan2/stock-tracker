@@ -30,8 +30,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: 运行筛选
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         run: python -m a_share_screener.runner
 
       - name: 提交筛选结果

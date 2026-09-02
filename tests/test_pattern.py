@@ -3,7 +3,12 @@ import unittest
 import pandas as pd
 
 from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_equal
-from a_share_screener.runner import screen
+from a_share_screener.runner import (
+    completed_trading_days,
+    eligible_stocks,
+    fetch_stock_history,
+    screen,
+)
 
 
 class PatternTests(unittest.TestCase):
@@ -37,6 +42,70 @@ class StockFilterTests(unittest.TestCase):
     def test_keeps_eligible_main_board_and_chinext_stocks(self) -> None:
         self.assertFalse(is_excluded_stock("600001.SH", "普通公司", "主板", "SSE"))
         self.assertFalse(is_excluded_stock("300001.SZ", "创业公司", "创业板", "SZSE"))
+
+
+class AkShareAdapterTests(unittest.TestCase):
+    def test_uses_only_completed_days_from_akshare_calendar(self) -> None:
+        class CalendarAkShare:
+            @staticmethod
+            def tool_trade_date_hist_sina() -> pd.DataFrame:
+                return pd.DataFrame(
+                    {"trade_date": ["2026-08-26", "2026-08-27", "2026-08-28", "2026-08-31"]}
+                )
+
+        self.assertEqual(
+            completed_trading_days(
+                CalendarAkShare(), reference_date=pd.Timestamp("2026-08-31").date()
+            ),
+            ["20260826", "20260827", "20260828"],
+        )
+
+    def test_filters_akshare_spot_list(self) -> None:
+        class SpotAkShare:
+            @staticmethod
+            def stock_zh_a_spot_em() -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        "代码": ["600001", "688001", "830001", "300001"],
+                        "名称": ["普通公司", "科创公司", "*ST公司", "创业公司"],
+                    }
+                )
+
+        stocks = eligible_stocks(SpotAkShare())
+
+        self.assertEqual(stocks["ts_code"].tolist(), ["600001", "300001"])
+
+    def test_normalizes_akshare_history_columns(self) -> None:
+        class HistoryAkShare:
+            @staticmethod
+            def stock_zh_a_hist(**kwargs: str) -> pd.DataFrame:
+                self.assertEqual(
+                    kwargs,
+                    {
+                        "symbol": "600001",
+                        "period": "daily",
+                        "start_date": "20260826",
+                        "end_date": "20260828",
+                        "adjust": "",
+                    },
+                )
+                return pd.DataFrame(
+                    {
+                        "日期": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "开盘": [9.8, 10.0, 10.2],
+                        "收盘": [10.0, 10.5, 10.3],
+                        "最高": [10.1, 10.7, 10.5],
+                        "最低": [9.7, 9.9, 10.0],
+                        "成交量": [100, 150, 80],
+                    }
+                )
+
+        result = fetch_stock_history(
+            HistoryAkShare(), "600001", ["20260826", "20260827", "20260828"]
+        )
+
+        self.assertEqual(result["trade_date"].tolist(), ["20260826", "20260827", "20260828"])
+        self.assertEqual(result["ts_code"].tolist(), ["600001", "600001", "600001"])
 
 
 class ScreeningTests(unittest.TestCase):

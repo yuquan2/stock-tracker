@@ -1,11 +1,10 @@
-"""Tushare Pro integration and CSV persistence for the A-share screener."""
+"""AkShare integration and CSV persistence for the A-share screener."""
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,72 +32,110 @@ RESULT_COLUMNS = [
 
 
 def completed_trading_days(
-    pro: Any, *, reference_date: date | None = None
+    ak: Any, *, reference_date: date | None = None
 ) -> list[str]:
     """Return the three latest open days strictly before the local date."""
     reference_date = reference_date or date.today()
-    start_date = reference_date - timedelta(days=21)
-    calendar = pro.trade_cal(
-        exchange="",
-        start_date=start_date.strftime("%Y%m%d"),
-        end_date=reference_date.strftime("%Y%m%d"),
-        fields="cal_date,is_open",
-    )
-    required_columns = {"cal_date", "is_open"}
+    calendar = ak.tool_trade_date_hist_sina()
+    required_columns = {"trade_date"}
     if calendar.empty or not required_columns.issubset(calendar.columns):
         raise RuntimeError("未获取到完整交易日历，已停止筛选。")
 
     calendar = calendar.copy()
-    calendar["cal_date"] = calendar["cal_date"].astype(str)
-    calendar["is_open"] = pd.to_numeric(calendar["is_open"], errors="coerce")
-    today_text = reference_date.strftime("%Y%m%d")
+    calendar["trade_date"] = pd.to_datetime(
+        calendar["trade_date"], errors="coerce"
+    )
     open_days = sorted(
         calendar.loc[
-            (calendar["is_open"] == 1) & (calendar["cal_date"] < today_text),
-            "cal_date",
-        ].unique()
+            calendar["trade_date"].notna()
+            & (calendar["trade_date"] < pd.Timestamp(reference_date)),
+            "trade_date",
+        ].dt.strftime("%Y%m%d").unique()
     )
     if len(open_days) < 3:
         raise RuntimeError("完整交易日不足三个，已停止筛选。")
     return list(open_days[-3:])
 
 
-def fetch_daily_bars(pro: Any, trading_days: list[str]) -> dict[str, pd.DataFrame]:
-    """Fetch and validate one complete market snapshot for each requested day."""
-    daily_bars: dict[str, pd.DataFrame] = {}
-    for trading_day in trading_days:
-        frame = pro.daily(trade_date=trading_day)
-        if frame.empty or not set(DAILY_FIELDS).issubset(frame.columns):
-            raise RuntimeError(f"{trading_day} 日线数据不完整，已停止筛选。")
-
-        frame = frame.loc[:, DAILY_FIELDS].copy()
-        if frame["ts_code"].duplicated().any():
-            raise RuntimeError(f"{trading_day} 日线数据存在重复证券，已停止筛选。")
-        for field in DAILY_FIELDS[1:]:
-            frame[field] = pd.to_numeric(frame[field], errors="coerce")
-        daily_bars[trading_day] = frame
-    return daily_bars
-
-
-def eligible_stocks(pro: Any) -> pd.DataFrame:
-    """Fetch listed stocks and remove excluded boards and ST-labelled names."""
-    stocks = pro.stock_basic(
-        exchange="",
-        list_status="L",
-        fields="ts_code,name,market,exchange",
-    )
-    required_columns = {"ts_code", "name", "market", "exchange"}
+def eligible_stocks(ak: Any) -> pd.DataFrame:
+    """Fetch A-share spot listings and remove excluded boards and ST names."""
+    stocks = ak.stock_zh_a_spot_em()
+    required_columns = {"代码", "名称"}
     if stocks.empty or not required_columns.issubset(stocks.columns):
         raise RuntimeError("未获取到完整股票列表，已停止筛选。")
 
-    stocks = stocks.loc[:, ["ts_code", "name", "market", "exchange"]].copy()
+    stocks = stocks.loc[:, ["代码", "名称"]].rename(
+        columns={"代码": "ts_code", "名称": "name"}
+    )
+    stocks["ts_code"] = stocks["ts_code"].astype(str).str.zfill(6)
     excluded = stocks.apply(
-        lambda row: is_excluded_stock(
-            row["ts_code"], row["name"], row["market"], row["exchange"]
-        ),
+        lambda row: is_excluded_stock(row["ts_code"], row["name"]),
         axis=1,
     )
     return stocks.loc[~excluded, ["ts_code", "name"]].drop_duplicates("ts_code")
+
+
+def fetch_stock_history(
+    ak: Any, ts_code: str, trading_days: list[str]
+) -> pd.DataFrame:
+    """Fetch one stock's unadjusted bars, retaining only the target days."""
+    history = ak.stock_zh_a_hist(
+        symbol=ts_code,
+        period="daily",
+        start_date=trading_days[0],
+        end_date=trading_days[-1],
+        adjust="",
+    )
+    source_columns = {"日期", "开盘", "收盘", "最高", "最低", "成交量"}
+    if history.empty:
+        return pd.DataFrame(columns=["trade_date", *DAILY_FIELDS])
+    if not source_columns.issubset(history.columns):
+        raise RuntimeError(f"{ts_code} 历史日线数据字段不完整，已停止筛选。")
+
+    history = history.loc[:, ["日期", "开盘", "收盘", "最高", "最低", "成交量"]].rename(
+        columns={
+            "日期": "trade_date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "vol",
+        }
+    )
+    history["trade_date"] = pd.to_datetime(
+        history["trade_date"], errors="coerce"
+    ).dt.strftime("%Y%m%d")
+    history.insert(1, "ts_code", ts_code)
+    history = history.loc[history["trade_date"].isin(trading_days)].copy()
+    if history["trade_date"].duplicated().any():
+        raise RuntimeError(f"{ts_code} 历史日线数据存在重复交易日，已停止筛选。")
+    for field in DAILY_FIELDS[1:]:
+        history[field] = pd.to_numeric(history[field], errors="coerce")
+    return history
+
+
+def fetch_daily_bars(
+    ak: Any, stocks: pd.DataFrame, trading_days: list[str], workers: int
+) -> dict[str, pd.DataFrame]:
+    """Fetch histories concurrently; only complete three-day records are screened."""
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+
+    stock_codes = stocks["ts_code"].tolist()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        histories = list(
+            executor.map(
+                lambda ts_code: fetch_stock_history(ak, ts_code, trading_days),
+                stock_codes,
+            )
+        )
+    combined = pd.concat(histories, ignore_index=True)
+    return {
+        trading_day: combined.loc[
+            combined["trade_date"] == trading_day, DAILY_FIELDS
+        ].copy()
+        for trading_day in trading_days
+    }
 
 
 def screen(
@@ -178,24 +215,28 @@ def parse_arguments() -> argparse.Namespace:
         default=Path("results"),
         help="结果 CSV 的目录（默认：results）。",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="并发获取历史日线的请求数（默认：8）。",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_arguments()
-    token = os.environ.get("TUSHARE_TOKEN")
-    if not token:
-        print("缺少环境变量 TUSHARE_TOKEN。", file=sys.stderr)
-        return 2
+    if args.workers < 1:
+        raise ValueError("--workers 必须至少为 1")
 
-    import tushare as ts
+    import akshare as ak
 
-    pro = ts.pro_api(token)
     trading_days = completed_trading_days(
-        pro, reference_date=datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        ak, reference_date=datetime.now(ZoneInfo("Asia/Shanghai")).date()
     )
-    daily_bars = fetch_daily_bars(pro, trading_days)
-    result = screen(eligible_stocks(pro), daily_bars, trading_days)
+    stocks = eligible_stocks(ak)
+    daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
+    result = screen(stocks, daily_bars, trading_days)
     destination = write_results(result, args.output_dir, trading_days[-1])
     print(f"已写入 {destination}，共 {len(result)} 只股票。")
     return 0
