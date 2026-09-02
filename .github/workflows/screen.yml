@@ -1,0 +1,45 @@
+name: A股日线形态筛选
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 17:20 Asia/Shanghai on weekdays; the script still checks the market calendar.
+    - cron: "20 9 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a-share-daily-screen
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行筛选
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: python -m a_share_screener.runner
+
+      - name: 提交筛选结果
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- results/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update A-share screening results"
+            git push
+          fi
