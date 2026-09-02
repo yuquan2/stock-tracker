@@ -11,6 +11,7 @@ from requests import ConnectionError
 from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_equal
 from a_share_screener.runner import (
     assemble_data,
+    assemble_data_from_logs,
     completed_trading_days,
     eligible_stocks,
     fetch_daily_bars,
@@ -160,6 +161,27 @@ class AkShareAdapterTests(unittest.TestCase):
         self.assertEqual(result["trade_date"].tolist(), ["20260826", "20260827", "20260828"])
         self.assertEqual(result["ts_code"].tolist(), ["600001", "600001", "600001"])
 
+    def test_converts_sz000_history_volume_from_lots_to_shares(self) -> None:
+        class HistoryAkShare:
+            @staticmethod
+            def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
+                    }
+                )
+
+        result = fetch_stock_history(
+            HistoryAkShare(), "000001", ["20260826", "20260827", "20260828"]
+        )
+
+        self.assertEqual(result["vol"].tolist(), [10000, 15000, 8000])
+
     def test_retries_transient_history_connection_error(self) -> None:
         class RetryingAkShare:
             attempts = 0
@@ -291,7 +313,7 @@ class ScreeningTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "pattern_date"], "20260828")
         self.assertEqual(result.loc[0, "d1_close"], 10.5)
 
-    def test_writes_and_reads_complete_data_log(self) -> None:
+    def test_writes_and_reads_daily_data_log(self) -> None:
         stocks = pd.DataFrame([{"ts_code": "600001", "name": "示例公司"}])
         daily_bars = {
             "20260826": pd.DataFrame(
@@ -311,8 +333,40 @@ class ScreeningTests(unittest.TestCase):
             loaded = read_data_log(destination)
 
         self.assertEqual(loaded.loc[0, "ts_code"], "600001")
-        self.assertEqual(loaded.loc[0, "d0_open"], 9.8)
-        self.assertEqual(loaded.loc[0, "d2_vol"], 80)
+        self.assertEqual(loaded.loc[0, "trade_date"], "20260828")
+        self.assertEqual(loaded.loc[0, "open"], 10.2)
+        self.assertEqual(loaded.loc[0, "vol"], 80)
+
+    def test_assembles_data_from_daily_logs(self) -> None:
+        with TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            paths = []
+            for trading_day, open_price in zip(
+                ["20260826", "20260827", "20260828"], [9.8, 10.0, 10.2], strict=True
+            ):
+                path = directory_path / f"{trading_day}.csv"
+                pd.DataFrame(
+                    [
+                        {
+                            "日期": trading_day,
+                            "股票代码": "600001",
+                            "股票名称": "示例公司",
+                            "开盘价": open_price,
+                            "收盘价": 10.5,
+                            "最高价": 10.7,
+                            "最低价": 9.9,
+                            "成交量(股)": 100,
+                        }
+                    ]
+                ).to_csv(path, index=False, encoding="utf-8-sig")
+                paths.append(path)
+
+            data = assemble_data_from_logs(
+                paths, ["20260826", "20260827", "20260828"]
+            )
+
+        self.assertEqual(data.loc[0, "d0_open"], 9.8)
+        self.assertEqual(data.loc[0, "d2_date"], "20260828")
 
     def test_writes_chinese_csv_headers(self) -> None:
         result = pd.DataFrame(
@@ -321,6 +375,16 @@ class ScreeningTests(unittest.TestCase):
                     "pattern_date": "20260901",
                     "ts_code": "600001",
                     "name": "示例公司",
+                    "d0_date": "20260828",
+                    "d0_vol": 100,
+                    "d1_date": "20260831",
+                    "d1_open": 10.0,
+                    "d1_close": 10.5,
+                    "d1_high": 10.7,
+                    "d1_vol": 150,
+                    "d2_date": "20260901",
+                    "d2_high": 10.5,
+                    "d2_low": 10.0,
                 }
             ]
         )
@@ -328,7 +392,21 @@ class ScreeningTests(unittest.TestCase):
             destination = write_results(result, Path(directory), "20260901")
             written = pd.read_csv(destination, encoding="utf-8-sig")
 
-        self.assertEqual(written.columns.tolist(), ["形态日期", "股票代码", "股票名称"])
+        self.assertEqual(
+            written.columns.tolist(),
+            [
+                "形态日期",
+                "股票代码",
+                "股票名称",
+                "D0(0828)成交量(股)",
+                "D1(0831)开盘价",
+                "D1(0831)收盘价",
+                "D1(0831)最高价",
+                "D1(0831)成交量(股)",
+                "D2(0901)最高价",
+                "D2(0901)最低价",
+            ],
+        )
 
 
 if __name__ == "__main__":
