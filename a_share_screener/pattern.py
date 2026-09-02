@@ -25,7 +25,7 @@ def is_excluded_stock(
         "ST" in normalized_name
         or normalized_market in {"科创板", "北交所"}
         or normalized_exchange == "BSE"
-        or code_prefix.startswith(("688", "689", "4", "8"))
+        or code_prefix.startswith(("688", "689", "4", "8", "920"))
     )
 
 def prices_equal(

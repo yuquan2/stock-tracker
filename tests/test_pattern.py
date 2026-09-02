@@ -11,6 +11,7 @@ from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_
 from a_share_screener.runner import (
     completed_trading_days,
     eligible_stocks,
+    fetch_daily_bars,
     fetch_stock_history,
     latest_completed_reference_date,
     screen,
@@ -45,6 +46,7 @@ class StockFilterTests(unittest.TestCase):
         self.assertTrue(is_excluded_stock("600001.SH", "*ST示例", "主板", "SSE"))
         self.assertTrue(is_excluded_stock("688001.SH", "普通公司", "科创板", "SSE"))
         self.assertTrue(is_excluded_stock("430001.BJ", "普通公司", "北交所", "BSE"))
+        self.assertTrue(is_excluded_stock("920045.BJ", "普通公司", "北交所", "BSE"))
 
     def test_keeps_eligible_main_board_and_chinext_stocks(self) -> None:
         self.assertFalse(is_excluded_stock("600001.SH", "普通公司", "主板", "SSE"))
@@ -83,12 +85,45 @@ class AkShareAdapterTests(unittest.TestCase):
                     {
                         "code": ["sh600001", "sh688001", "bj830001", "sz300001"],
                         "name": ["普通公司", "科创公司", "*ST公司", "创业公司"],
+                        "stock_type": ["GP-A-SH", "GP-A-KCB", "GP-A-BJ", "GP-A-CYB"],
                     }
                 )
 
         stocks = eligible_stocks(SpotAkShare())
 
         self.assertEqual(stocks["ts_code"].tolist(), ["600001", "300001"])
+
+    def test_excludes_non_a_share_security_types(self) -> None:
+        class SpotAkShare:
+            @staticmethod
+            def stock_zh_a_spot_tx() -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        "code": ["sh600001", "sh900001"],
+                        "name": ["普通公司", "B股公司"],
+                        "stock_type": ["GP-A", "GP"],
+                    }
+                )
+
+        stocks = eligible_stocks(SpotAkShare())
+
+        self.assertEqual(stocks["ts_code"].tolist(), ["600001"])
+
+    def test_handles_stock_without_history_without_concat_warning(self) -> None:
+        class EmptyHistoryAkShare:
+            @staticmethod
+            def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
+                return pd.DataFrame()
+
+        bars = fetch_daily_bars(
+            EmptyHistoryAkShare(),
+            pd.DataFrame([{"ts_code": "600001", "name": "示例公司"}]),
+            ["20260826", "20260827", "20260828"],
+            workers=1,
+        )
+
+        self.assertTrue(all(frame.empty for frame in bars.values()))
+        self.assertTrue(all(frame.columns.tolist() == ["ts_code", "open", "close", "high", "low", "vol"] for frame in bars.values()))
 
     def test_normalizes_akshare_history_columns(self) -> None:
         class HistoryAkShare:

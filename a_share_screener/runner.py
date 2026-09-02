@@ -87,11 +87,11 @@ def latest_completed_reference_date(now: datetime) -> date:
 def eligible_stocks(ak: Any) -> pd.DataFrame:
     """Fetch A-share spot listings and remove excluded boards and ST names."""
     stocks = ak.stock_zh_a_spot_tx()
-    required_columns = {"code", "name"}
+    required_columns = {"code", "name", "stock_type"}
     if stocks.empty or not required_columns.issubset(stocks.columns):
         raise RuntimeError("未获取到完整股票列表，已停止筛选。")
 
-    stocks = stocks.loc[:, ["code", "name"]].rename(
+    stocks = stocks.loc[:, ["code", "name", "stock_type"]].rename(
         columns={"code": "ts_code"}
     )
     stocks["ts_code"] = stocks["ts_code"].astype(str).str[-6:].str.zfill(6)
@@ -99,7 +99,10 @@ def eligible_stocks(ak: Any) -> pd.DataFrame:
         lambda row: is_excluded_stock(row["ts_code"], row["name"]),
         axis=1,
     )
-    return stocks.loc[~excluded, ["ts_code", "name"]].drop_duplicates("ts_code")
+    is_a_share = stocks["stock_type"].str.startswith("GP-A", na=False)
+    return stocks.loc[is_a_share & ~excluded, ["ts_code", "name"]].drop_duplicates(
+        "ts_code"
+    )
 
 
 def fetch_stock_history(
@@ -163,6 +166,12 @@ def fetch_daily_bars(
                 stock_codes,
             )
         )
+    histories = [history for history in histories if not history.empty]
+    if not histories:
+        return {
+            trading_day: pd.DataFrame(columns=DAILY_FIELDS)
+            for trading_day in trading_days
+        }
     combined = pd.concat(histories, ignore_index=True)
     return {
         trading_day: combined.loc[
