@@ -1,6 +1,8 @@
 import unittest
+from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from requests import ConnectionError
@@ -10,6 +12,7 @@ from a_share_screener.runner import (
     completed_trading_days,
     eligible_stocks,
     fetch_stock_history,
+    latest_completed_reference_date,
     screen,
     write_results,
 )
@@ -49,6 +52,14 @@ class StockFilterTests(unittest.TestCase):
 
 
 class AkShareAdapterTests(unittest.TestCase):
+    def test_uses_today_as_d2_after_market_data_is_complete(self) -> None:
+        after_close = datetime(2026, 8, 31, 17, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(latest_completed_reference_date(after_close).isoformat(), "2026-08-31")
+
+    def test_uses_previous_date_before_market_data_is_complete(self) -> None:
+        before_close = datetime(2026, 8, 31, 15, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(latest_completed_reference_date(before_close).isoformat(), "2026-08-30")
+
     def test_uses_only_completed_days_from_akshare_calendar(self) -> None:
         class CalendarAkShare:
             @staticmethod
@@ -61,7 +72,7 @@ class AkShareAdapterTests(unittest.TestCase):
             completed_trading_days(
                 CalendarAkShare(), reference_date=pd.Timestamp("2026-08-31").date()
             ),
-            ["20260826", "20260827", "20260828"],
+            ["20260827", "20260828", "20260831"],
         )
 
     def test_filters_akshare_spot_list(self) -> None:

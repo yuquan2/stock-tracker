@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
 import time
@@ -18,6 +18,7 @@ from a_share_screener.pattern import is_excluded_stock, matches_pattern
 
 DAILY_FIELDS = ["ts_code", "open", "close", "high", "low", "vol"]
 HISTORY_REQUEST_ATTEMPTS = 3
+MARKET_DATA_COMPLETE_HOUR = 16
 RESULT_COLUMNS = [
     "pattern_date",
     "ts_code",
@@ -53,7 +54,7 @@ CSV_COLUMN_NAMES = {
 def completed_trading_days(
     ak: Any, *, reference_date: date | None = None
 ) -> list[str]:
-    """Return the three latest open days strictly before the local date."""
+    """Return the three latest open days through the supplied D2 date."""
     reference_date = reference_date or date.today()
     calendar = ak.tool_trade_date_hist_sina()
     required_columns = {"trade_date"}
@@ -67,13 +68,20 @@ def completed_trading_days(
     open_days = sorted(
         calendar.loc[
             calendar["trade_date"].notna()
-            & (calendar["trade_date"] < pd.Timestamp(reference_date)),
+            & (calendar["trade_date"] <= pd.Timestamp(reference_date)),
             "trade_date",
         ].dt.strftime("%Y%m%d").unique()
     )
     if len(open_days) < 3:
         raise RuntimeError("完整交易日不足三个，已停止筛选。")
     return list(open_days[-3:])
+
+
+def latest_completed_reference_date(now: datetime) -> date:
+    """Use today's bar only after the daily market data has settled."""
+    if now.hour >= MARKET_DATA_COMPLETE_HOUR:
+        return now.date()
+    return (now - timedelta(days=1)).date()
 
 
 def eligible_stocks(ak: Any) -> pd.DataFrame:
@@ -259,8 +267,9 @@ def main() -> int:
 
     import akshare as ak
 
+    shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     trading_days = completed_trading_days(
-        ak, reference_date=datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
     stocks = eligible_stocks(ak)
     daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
