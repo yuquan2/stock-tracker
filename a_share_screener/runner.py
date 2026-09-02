@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from a_share_screener.pattern import is_excluded_stock, matches_pattern
 DAILY_FIELDS = ["ts_code", "open", "close", "high", "low", "vol"]
 BAR_FIELDS = DAILY_FIELDS[1:]
 HISTORY_REQUEST_ATTEMPTS = 3
+HISTORY_REQUEST_TIMEOUT_SECONDS = 30
 MARKET_DATA_COMPLETE_HOUR = 16
 RESULT_COLUMNS = [
     "pattern_date",
@@ -123,6 +125,7 @@ def fetch_stock_history(
                 start_date=trading_days[0],
                 end_date=trading_days[-1],
                 adjust="",
+                timeout=HISTORY_REQUEST_TIMEOUT_SECONDS,
             )
             break
         except (RequestException, IndexError) as error:
@@ -167,20 +170,35 @@ def fetch_stock_history(
 
 
 def fetch_daily_bars(
-    ak: Any, stocks: pd.DataFrame, trading_days: list[str], workers: int
+    ak: Any,
+    stocks: pd.DataFrame,
+    trading_days: list[str],
+    workers: int,
+    *,
+    on_history_fetched: Callable[[pd.DataFrame], None] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch histories concurrently; only complete three-day records are screened."""
+    """Fetch histories concurrently, reporting each completed history to a checkpoint."""
     if workers < 1:
         raise ValueError("workers must be at least 1")
 
+    # AkShare's per-request tqdm instances are not safe to update from worker threads.
+    from akshare.stock_feature import stock_hist_tx
+
+    stock_hist_tx.get_tqdm = lambda: _plain_progress
     stock_codes = stocks["ts_code"].tolist()
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        histories = list(
-            executor.map(
-                lambda ts_code: fetch_stock_history(ak, ts_code, trading_days),
-                stock_codes,
-            )
-        )
+        futures = {
+            executor.submit(fetch_stock_history, ak, ts_code, trading_days): ts_code
+            for ts_code in stock_codes
+        }
+        histories = []
+        for completed, future in enumerate(as_completed(futures), start=1):
+            history = future.result()
+            if not history.empty:
+                histories.append(history)
+                if on_history_fetched is not None:
+                    on_history_fetched(history)
+            print(f"已获取 {completed}/{len(futures)} 只股票。")
     histories = [history for history in histories if not history.empty]
     if not histories:
         return {
@@ -194,6 +212,11 @@ def fetch_daily_bars(
         ].copy()
         for trading_day in trading_days
     }
+
+
+def _plain_progress(iterable: Any, **_: Any) -> Any:
+    """Return the iterable without rendering a shared terminal progress bar."""
+    return iterable
 
 
 def assemble_data(
@@ -295,9 +318,6 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
 
 def write_data_log(data: pd.DataFrame, data_dir: Path, pattern_date: str) -> Path:
     """Atomically persist the D2 all-stock OHLCV snapshot."""
-    data_dir.mkdir(parents=True, exist_ok=True)
-    destination = data_dir / f"{pattern_date}.csv"
-    temporary = destination.with_suffix(".csv.tmp")
     snapshot = data.loc[
         :,
         ["d2_date", "ts_code", "name", "d2_open", "d2_close", "d2_high", "d2_low", "d2_vol"],
@@ -311,13 +331,107 @@ def write_data_log(data: pd.DataFrame, data_dir: Path, pattern_date: str) -> Pat
             "d2_vol": "vol",
         }
     )
-    snapshot.reindex(columns=DAILY_DATA_COLUMNS).rename(
+    return write_daily_data_log(snapshot, data_dir, pattern_date)
+
+
+def write_daily_data_log(
+    snapshot: pd.DataFrame, data_dir: Path, trading_day: str
+) -> Path:
+    """Atomically persist one all-stock OHLCV snapshot sorted by stock code."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    destination = data_dir / f"{trading_day}.csv"
+    temporary = destination.with_suffix(".csv.tmp")
+    snapshot.sort_values("ts_code", kind="stable").reindex(
+        columns=DAILY_DATA_COLUMNS
+    ).rename(
         columns=DATA_CSV_COLUMN_NAMES
     ).to_csv(
         temporary, index=False, encoding="utf-8-sig"
     )
     temporary.replace(destination)
     return destination
+
+
+def append_daily_data_checkpoint(
+    history: pd.DataFrame,
+    stock_names: dict[str, str],
+    data_dir: Path,
+) -> None:
+    """Persist a completed stock history so interrupted downloads retain progress."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = history.assign(name=history["ts_code"].map(stock_names)).reindex(
+        columns=DAILY_DATA_COLUMNS
+    )
+    for trading_day, daily_snapshot in snapshot.groupby("trade_date"):
+        checkpoint = data_dir / f".{trading_day}.partial.csv"
+        daily_snapshot.rename(columns=DATA_CSV_COLUMN_NAMES).to_csv(
+            checkpoint,
+            mode="a",
+            header=not checkpoint.exists(),
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+
+def populate_missing_data_logs(
+    ak: Any,
+    data_dir: Path,
+    trading_days: list[str],
+    workers: int,
+    *,
+    refresh_data: bool = False,
+) -> list[Path]:
+    """Fetch and persist only the requested daily snapshots absent from the cache."""
+    data_paths = [data_dir / f"{trading_day}.csv" for trading_day in trading_days]
+    days_to_fetch = trading_days if refresh_data else [
+        trading_day
+        for trading_day, path in zip(trading_days, data_paths, strict=True)
+        if not path.exists()
+    ]
+    if not days_to_fetch:
+        return data_paths
+
+    stocks = eligible_stocks(ak)
+    checkpoint_bars: dict[str, pd.DataFrame] = {}
+    completed_codes: set[str] | None = None
+    for trading_day in days_to_fetch:
+        checkpoint = data_dir / f".{trading_day}.partial.csv"
+        if checkpoint.exists():
+            bars = read_data_log(checkpoint).loc[:, DAILY_FIELDS]
+            checkpoint_bars[trading_day] = bars
+            codes = set(bars["ts_code"])
+            completed_codes = codes if completed_codes is None else completed_codes & codes
+        else:
+            checkpoint_bars[trading_day] = pd.DataFrame(columns=DAILY_FIELDS)
+            completed_codes = set()
+    stocks_to_fetch = stocks.loc[~stocks["ts_code"].isin(completed_codes)].copy()
+    stock_names = stocks.set_index("ts_code")["name"].to_dict()
+    daily_bars = fetch_daily_bars(
+        ak,
+        stocks_to_fetch,
+        days_to_fetch,
+        workers,
+        on_history_fetched=lambda history: append_daily_data_checkpoint(
+            history, stock_names, data_dir
+        ),
+    )
+    for trading_day in days_to_fetch:
+        if not checkpoint_bars[trading_day].empty:
+            daily_bars[trading_day] = pd.concat(
+                [checkpoint_bars[trading_day], daily_bars[trading_day]],
+                ignore_index=True,
+            )
+        snapshot = stocks.merge(
+            daily_bars[trading_day],
+            on="ts_code",
+            how="inner",
+            validate="one_to_one",
+        )
+        snapshot.insert(0, "trade_date", trading_day)
+        data_path = write_daily_data_log(snapshot, data_dir, trading_day)
+        (data_dir / f".{trading_day}.partial.csv").unlink(missing_ok=True)
+        print(f"已写入日线数据 {data_path}，共 {len(snapshot)} 只股票。")
+    return data_paths
 
 
 def read_data_log(path: Path) -> pd.DataFrame:
@@ -377,8 +491,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=32,
-        help="并发获取历史日线的请求数（默认：32）。",
+        default=8,
+        help="并发获取历史日线的请求数（默认：8）。",
     )
     return parser.parse_args()
 
@@ -395,16 +509,15 @@ def main() -> int:
         ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
     pattern_date = trading_days[-1]
-    data_paths = [args.data_dir / f"{trading_day}.csv" for trading_day in trading_days]
-    if all(path.exists() for path in data_paths) and not args.refresh_data:
-        data = assemble_data_from_logs(data_paths, trading_days)
-        print(f"复用本地日线数据，共 {len(data)} 只股票。")
-    else:
-        stocks = eligible_stocks(ak)
-        daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
-        data = assemble_data(stocks, daily_bars, trading_days)
-        data_path = write_data_log(data, args.data_dir, pattern_date)
-        print(f"已写入日线数据 {data_path}，共 {len(data)} 只股票。")
+    data_paths = populate_missing_data_logs(
+        ak,
+        args.data_dir,
+        trading_days,
+        args.workers,
+        refresh_data=args.refresh_data,
+    )
+    data = assemble_data_from_logs(data_paths, trading_days)
+    print(f"复用本地日线数据，共 {len(data)} 只股票。")
     result = screen_data(data)
     destination = write_results(result, args.output_dir, pattern_date)
     print(f"已写入 {destination}，共 {len(result)} 只股票。")

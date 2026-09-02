@@ -12,13 +12,16 @@ from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_
 from a_share_screener.runner import (
     assemble_data,
     assemble_data_from_logs,
+    append_daily_data_checkpoint,
     completed_trading_days,
     eligible_stocks,
     fetch_daily_bars,
     fetch_stock_history,
     latest_completed_reference_date,
+    populate_missing_data_logs,
     read_data_log,
     screen,
+    write_daily_data_log,
     write_results,
     write_data_log,
 )
@@ -141,6 +144,7 @@ class AkShareAdapterTests(unittest.TestCase):
                         "start_date": "20260826",
                         "end_date": "20260828",
                         "adjust": "",
+                        "timeout": 30,
                     },
                 )
                 return pd.DataFrame(
@@ -367,6 +371,115 @@ class ScreeningTests(unittest.TestCase):
 
         self.assertEqual(data.loc[0, "d0_open"], 9.8)
         self.assertEqual(data.loc[0, "d2_date"], "20260828")
+
+    def test_fetches_only_missing_daily_data_log(self) -> None:
+        class HistoryAkShare:
+            requested_days: list[tuple[str, str]] = []
+
+            @staticmethod
+            def stock_zh_a_spot_tx() -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        "code": ["sh600001"],
+                        "name": ["示例公司"],
+                        "stock_type": ["GP-A"],
+                    }
+                )
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                cls.requested_days.append((kwargs["start_date"], kwargs["end_date"]))
+                return pd.DataFrame(
+                    {
+                        "date": [kwargs["start_date"]],
+                        "open": [10.2],
+                        "close": [10.3],
+                        "high": [10.5],
+                        "low": [10.0],
+                        "volume": [80],
+                    }
+                )
+
+        trading_days = ["20260826", "20260827", "20260828"]
+        with TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            for trading_day in trading_days[:2]:
+                pd.DataFrame(
+                    [
+                        {
+                            "日期": trading_day,
+                            "股票代码": "600001",
+                            "股票名称": "示例公司",
+                            "开盘价": 10.0,
+                            "收盘价": 10.5,
+                            "最高价": 10.7,
+                            "最低价": 9.9,
+                            "成交量(股)": 100,
+                        }
+                    ]
+                ).to_csv(data_dir / f"{trading_day}.csv", index=False, encoding="utf-8-sig")
+
+            paths = populate_missing_data_logs(
+                HistoryAkShare(), data_dir, trading_days, workers=1
+            )
+
+            self.assertEqual(HistoryAkShare.requested_days, [("20260828", "20260828")])
+            self.assertTrue(all(path.exists() for path in paths))
+
+    def test_persists_completed_history_checkpoint(self) -> None:
+        history = pd.DataFrame(
+            [
+                {
+                    "trade_date": "20260828",
+                    "ts_code": "600001",
+                    "open": 10.2,
+                    "close": 10.3,
+                    "high": 10.5,
+                    "low": 10.0,
+                    "vol": 80,
+                }
+            ]
+        )
+        with TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            append_daily_data_checkpoint(
+                history, {"600001": "示例公司"}, data_dir
+            )
+            checkpoint = read_data_log(data_dir / ".20260828.partial.csv")
+
+        self.assertEqual(checkpoint.loc[0, "ts_code"], "600001")
+        self.assertEqual(checkpoint.loc[0, "trade_date"], "20260828")
+
+    def test_sorts_daily_data_log_by_stock_code(self) -> None:
+        snapshot = pd.DataFrame(
+            [
+                {
+                    "trade_date": "20260828",
+                    "ts_code": "600002",
+                    "name": "第二家公司",
+                    "open": 10.2,
+                    "close": 10.3,
+                    "high": 10.5,
+                    "low": 10.0,
+                    "vol": 80,
+                },
+                {
+                    "trade_date": "20260828",
+                    "ts_code": "000001",
+                    "name": "第一家公司",
+                    "open": 10.2,
+                    "close": 10.3,
+                    "high": 10.5,
+                    "low": 10.0,
+                    "vol": 80,
+                },
+            ]
+        )
+        with TemporaryDirectory() as directory:
+            destination = write_daily_data_log(snapshot, Path(directory), "20260828")
+            written = read_data_log(destination)
+
+        self.assertEqual(written["ts_code"].tolist(), ["000001", "600002"])
 
     def test_writes_chinese_csv_headers(self) -> None:
         result = pd.DataFrame(
