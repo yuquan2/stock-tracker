@@ -1,6 +1,7 @@
 import unittest
 
 import pandas as pd
+from requests import ConnectionError
 
 from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_equal
 from a_share_screener.runner import (
@@ -63,11 +64,11 @@ class AkShareAdapterTests(unittest.TestCase):
     def test_filters_akshare_spot_list(self) -> None:
         class SpotAkShare:
             @staticmethod
-            def stock_zh_a_spot_em() -> pd.DataFrame:
+            def stock_zh_a_spot_tx() -> pd.DataFrame:
                 return pd.DataFrame(
                     {
-                        "代码": ["600001", "688001", "830001", "300001"],
-                        "名称": ["普通公司", "科创公司", "*ST公司", "创业公司"],
+                        "code": ["sh600001", "sh688001", "bj830001", "sz300001"],
+                        "name": ["普通公司", "科创公司", "*ST公司", "创业公司"],
                     }
                 )
 
@@ -78,12 +79,11 @@ class AkShareAdapterTests(unittest.TestCase):
     def test_normalizes_akshare_history_columns(self) -> None:
         class HistoryAkShare:
             @staticmethod
-            def stock_zh_a_hist(**kwargs: str) -> pd.DataFrame:
+            def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
                 self.assertEqual(
                     kwargs,
                     {
-                        "symbol": "600001",
-                        "period": "daily",
+                        "symbol": "sh600001",
                         "start_date": "20260826",
                         "end_date": "20260828",
                         "adjust": "",
@@ -91,12 +91,12 @@ class AkShareAdapterTests(unittest.TestCase):
                 )
                 return pd.DataFrame(
                     {
-                        "日期": ["2026-08-26", "2026-08-27", "2026-08-28"],
-                        "开盘": [9.8, 10.0, 10.2],
-                        "收盘": [10.0, 10.5, 10.3],
-                        "最高": [10.1, 10.7, 10.5],
-                        "最低": [9.7, 9.9, 10.0],
-                        "成交量": [100, 150, 80],
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
                     }
                 )
 
@@ -106,6 +106,32 @@ class AkShareAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["trade_date"].tolist(), ["20260826", "20260827", "20260828"])
         self.assertEqual(result["ts_code"].tolist(), ["600001", "600001", "600001"])
+
+    def test_retries_transient_history_connection_error(self) -> None:
+        class RetryingAkShare:
+            attempts = 0
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                cls.attempts += 1
+                if cls.attempts == 1:
+                    raise ConnectionError("temporary disconnect")
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
+                    }
+                )
+
+        fetch_stock_history(
+            RetryingAkShare(), "600001", ["20260826", "20260827", "20260828"]
+        )
+
+        self.assertEqual(RetryingAkShare.attempts, 2)
 
 
 class ScreeningTests(unittest.TestCase):

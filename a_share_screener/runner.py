@@ -6,14 +6,18 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
+import sys
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from requests import RequestException
 
 from a_share_screener.pattern import is_excluded_stock, matches_pattern
 
 DAILY_FIELDS = ["ts_code", "open", "close", "high", "low", "vol"]
+HISTORY_REQUEST_ATTEMPTS = 3
 RESULT_COLUMNS = [
     "pattern_date",
     "ts_code",
@@ -59,15 +63,15 @@ def completed_trading_days(
 
 def eligible_stocks(ak: Any) -> pd.DataFrame:
     """Fetch A-share spot listings and remove excluded boards and ST names."""
-    stocks = ak.stock_zh_a_spot_em()
-    required_columns = {"代码", "名称"}
+    stocks = ak.stock_zh_a_spot_tx()
+    required_columns = {"code", "name"}
     if stocks.empty or not required_columns.issubset(stocks.columns):
         raise RuntimeError("未获取到完整股票列表，已停止筛选。")
 
-    stocks = stocks.loc[:, ["代码", "名称"]].rename(
-        columns={"代码": "ts_code", "名称": "name"}
+    stocks = stocks.loc[:, ["code", "name"]].rename(
+        columns={"code": "ts_code"}
     )
-    stocks["ts_code"] = stocks["ts_code"].astype(str).str.zfill(6)
+    stocks["ts_code"] = stocks["ts_code"].astype(str).str[-6:].str.zfill(6)
     excluded = stocks.apply(
         lambda row: is_excluded_stock(row["ts_code"], row["name"]),
         axis=1,
@@ -79,27 +83,34 @@ def fetch_stock_history(
     ak: Any, ts_code: str, trading_days: list[str]
 ) -> pd.DataFrame:
     """Fetch one stock's unadjusted bars, retaining only the target days."""
-    history = ak.stock_zh_a_hist(
-        symbol=ts_code,
-        period="daily",
-        start_date=trading_days[0],
-        end_date=trading_days[-1],
-        adjust="",
-    )
-    source_columns = {"日期", "开盘", "收盘", "最高", "最低", "成交量"}
+    exchange_prefix = "sh" if ts_code.startswith("6") else "sz"
+    for attempt in range(1, HISTORY_REQUEST_ATTEMPTS + 1):
+        try:
+            history = ak.stock_zh_a_hist_tx(
+                symbol=f"{exchange_prefix}{ts_code}",
+                start_date=trading_days[0],
+                end_date=trading_days[-1],
+                adjust="",
+            )
+            break
+        except RequestException:
+            if attempt == HISTORY_REQUEST_ATTEMPTS:
+                raise
+            print(
+                f"{ts_code} 历史日线请求失败，正在进行第 {attempt + 1} 次尝试。",
+                file=sys.stderr,
+            )
+            time.sleep(attempt)
+    source_columns = {"date", "open", "close", "high", "low", "volume"}
     if history.empty:
         return pd.DataFrame(columns=["trade_date", *DAILY_FIELDS])
     if not source_columns.issubset(history.columns):
         raise RuntimeError(f"{ts_code} 历史日线数据字段不完整，已停止筛选。")
 
-    history = history.loc[:, ["日期", "开盘", "收盘", "最高", "最低", "成交量"]].rename(
+    history = history.loc[:, ["date", "open", "close", "high", "low", "volume"]].rename(
         columns={
-            "日期": "trade_date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "vol",
+            "date": "trade_date",
+            "volume": "vol",
         }
     )
     history["trade_date"] = pd.to_datetime(
