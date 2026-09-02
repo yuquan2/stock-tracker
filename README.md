@@ -24,7 +24,7 @@ pip install -r requirements.txt
 python -m a_share_screener.runner
 ```
 
-结果写入 `results/YYYYMMDD.csv`，日期为形态的 `D2` 交易日。数据通过 AkShare 的交易日历、腾讯 A 股现货列表与腾讯不复权历史日线接口获取，无需环境变量或密钥。
+结果写入 `results/YYYYMMDD.csv`，日期为形态的 `D2` 交易日，表头为中文（如“形态日期”“股票代码”“D1收盘价”）。数据通过 AkShare 的交易日历、腾讯 A 股现货列表与腾讯不复权历史日线接口获取，无需环境变量或密钥。
 
 运行不访问网络的单元测试：
 

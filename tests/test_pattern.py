@@ -1,4 +1,6 @@
 import unittest
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 import pandas as pd
 from requests import ConnectionError
@@ -9,6 +11,7 @@ from a_share_screener.runner import (
     eligible_stocks,
     fetch_stock_history,
     screen,
+    write_results,
 )
 
 
@@ -194,6 +197,22 @@ class ScreeningTests(unittest.TestCase):
         self.assertEqual(result["ts_code"].tolist(), ["600001.SH"])
         self.assertEqual(result.loc[0, "pattern_date"], "20260828")
         self.assertEqual(result.loc[0, "d1_close"], 10.5)
+
+    def test_writes_chinese_csv_headers(self) -> None:
+        result = pd.DataFrame(
+            [
+                {
+                    "pattern_date": "20260901",
+                    "ts_code": "600001",
+                    "name": "示例公司",
+                }
+            ]
+        )
+        with TemporaryDirectory() as directory:
+            destination = write_results(result, Path(directory), "20260901")
+            written = pd.read_csv(destination, encoding="utf-8-sig")
+
+        self.assertEqual(written.columns.tolist(), ["形态日期", "股票代码", "股票名称"])
 
 
 if __name__ == "__main__":

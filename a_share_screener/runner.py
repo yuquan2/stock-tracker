@@ -33,6 +33,21 @@ RESULT_COLUMNS = [
     "d2_high",
     "d2_low",
 ]
+CSV_COLUMN_NAMES = {
+    "pattern_date": "形态日期",
+    "ts_code": "股票代码",
+    "name": "股票名称",
+    "d0_date": "D0日期",
+    "d0_vol": "D0成交量",
+    "d1_date": "D1日期",
+    "d1_open": "D1开盘价",
+    "d1_close": "D1收盘价",
+    "d1_high": "D1最高价",
+    "d1_vol": "D1成交量",
+    "d2_date": "D2日期",
+    "d2_high": "D2最高价",
+    "d2_low": "D2最低价",
+}
 
 
 def completed_trading_days(
@@ -213,7 +228,9 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{pattern_date}.csv"
     temporary = destination.with_suffix(".csv.tmp")
-    result.to_csv(temporary, index=False, encoding="utf-8-sig")
+    result.rename(columns=CSV_COLUMN_NAMES).to_csv(
+        temporary, index=False, encoding="utf-8-sig"
+    )
     temporary.replace(destination)
     return destination
 
