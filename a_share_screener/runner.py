@@ -35,54 +35,25 @@ RESULT_COLUMNS = [
     "d2_high",
     "d2_low",
 ]
-CSV_COLUMN_NAMES = {
-    "pattern_date": "形态日期",
-    "ts_code": "股票代码",
-    "name": "股票名称",
-    "d0_date": "D0日期",
-    "d0_vol": "D0成交量",
-    "d1_date": "D1日期",
-    "d1_open": "D1开盘价",
-    "d1_close": "D1收盘价",
-    "d1_high": "D1最高价",
-    "d1_vol": "D1成交量",
-    "d2_date": "D2日期",
-    "d2_high": "D2最高价",
-    "d2_low": "D2最低价",
-}
-DATA_COLUMNS = [
-    "pattern_date",
+DAILY_DATA_COLUMNS = [
+    "trade_date",
     "ts_code",
     "name",
-    *[
-        field
-        for day in ("d0", "d1", "d2")
-        for field in (
-            f"{day}_date",
-            f"{day}_open",
-            f"{day}_close",
-            f"{day}_high",
-            f"{day}_low",
-            f"{day}_vol",
-        )
-    ],
+    "open",
+    "close",
+    "high",
+    "low",
+    "vol",
 ]
 DATA_CSV_COLUMN_NAMES = {
-    "pattern_date": "形态日期",
+    "trade_date": "日期",
     "ts_code": "股票代码",
     "name": "股票名称",
-    **{
-        f"{day}_{field}": f"{day.upper()}{chinese_name}"
-        for day in ("d0", "d1", "d2")
-        for field, chinese_name in {
-            "date": "日期",
-            "open": "开盘价",
-            "close": "收盘价",
-            "high": "最高价",
-            "low": "最低价",
-            "vol": "成交量",
-        }.items()
-    },
+    "open": "开盘价",
+    "close": "收盘价",
+    "high": "最高价",
+    "low": "最低价",
+    "vol": "成交量(股)",
 }
 
 
@@ -189,6 +160,9 @@ def fetch_stock_history(
         raise RuntimeError(f"{ts_code} 历史日线数据存在重复交易日，已停止筛选。")
     for field in DAILY_FIELDS[1:]:
         history[field] = pd.to_numeric(history[field], errors="coerce")
+    # AkShare 1.18.x leaves sz000xxx equities in lots while other equities are shares.
+    if ts_code.startswith("000"):
+        history["vol"] = history["vol"] * 100
     return history
 
 
@@ -239,7 +213,25 @@ def assemble_data(
             trading_day,
         )
     merged.insert(0, "pattern_date", d2_date)
-    return merged.reindex(columns=DATA_COLUMNS)
+    return merged.reindex(
+        columns=[
+            "pattern_date",
+            "ts_code",
+            "name",
+            *[
+                field
+                for day in ("d0", "d1", "d2")
+                for field in (
+                    f"{day}_date",
+                    f"{day}_open",
+                    f"{day}_close",
+                    f"{day}_high",
+                    f"{day}_low",
+                    f"{day}_vol",
+                )
+            ],
+        ]
+    )
 
 
 def screen_data(data: pd.DataFrame) -> pd.DataFrame:
@@ -271,7 +263,30 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{pattern_date}.csv"
     temporary = destination.with_suffix(".csv.tmp")
-    result.rename(columns=CSV_COLUMN_NAMES).to_csv(
+    result = result.copy()
+    result_headers = {
+        "pattern_date": "形态日期",
+        "ts_code": "股票代码",
+        "name": "股票名称",
+    }
+    for day in ("d0", "d1", "d2"):
+        dates = result[f"{day}_date"].dropna().unique()
+        if len(dates) > 1:
+            raise RuntimeError(f"结果包含多个 {day.upper()} 日期，无法写入 CSV。")
+        date_suffix = str(dates[0])[-4:] if len(dates) else ""
+        prefix = f"{day.upper()}({date_suffix})"
+        result_headers.update(
+            {
+                f"{day}_open": f"{prefix}开盘价",
+                f"{day}_close": f"{prefix}收盘价",
+                f"{day}_high": f"{prefix}最高价",
+                f"{day}_low": f"{prefix}最低价",
+                f"{day}_vol": f"{prefix}成交量(股)",
+            }
+        )
+    result.drop(columns=["d0_date", "d1_date", "d2_date"]).rename(
+        columns=result_headers
+    ).to_csv(
         temporary, index=False, encoding="utf-8-sig"
     )
     temporary.replace(destination)
@@ -279,11 +294,26 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
 
 
 def write_data_log(data: pd.DataFrame, data_dir: Path, pattern_date: str) -> Path:
-    """Atomically persist the complete eligible universe for later local re-screening."""
+    """Atomically persist the D2 all-stock OHLCV snapshot."""
     data_dir.mkdir(parents=True, exist_ok=True)
     destination = data_dir / f"{pattern_date}.csv"
     temporary = destination.with_suffix(".csv.tmp")
-    data.reindex(columns=DATA_COLUMNS).rename(columns=DATA_CSV_COLUMN_NAMES).to_csv(
+    snapshot = data.loc[
+        :,
+        ["d2_date", "ts_code", "name", "d2_open", "d2_close", "d2_high", "d2_low", "d2_vol"],
+    ].rename(
+        columns={
+            "d2_date": "trade_date",
+            "d2_open": "open",
+            "d2_close": "close",
+            "d2_high": "high",
+            "d2_low": "low",
+            "d2_vol": "vol",
+        }
+    )
+    snapshot.reindex(columns=DAILY_DATA_COLUMNS).rename(
+        columns=DATA_CSV_COLUMN_NAMES
+    ).to_csv(
         temporary, index=False, encoding="utf-8-sig"
     )
     temporary.replace(destination)
@@ -291,19 +321,38 @@ def write_data_log(data: pd.DataFrame, data_dir: Path, pattern_date: str) -> Pat
 
 
 def read_data_log(path: Path) -> pd.DataFrame:
-    """Load and validate a locally cached complete daily dataset."""
-    data = pd.read_csv(path, encoding="utf-8-sig", dtype={"股票代码": str})
+    """Load and validate a locally cached all-stock daily snapshot."""
+    data = pd.read_csv(
+        path, encoding="utf-8-sig", dtype={"日期": str, "股票代码": str}
+    )
     data = data.rename(
         columns={chinese_name: field for field, chinese_name in DATA_CSV_COLUMN_NAMES.items()}
     )
-    missing_columns = set(DATA_COLUMNS).difference(data.columns)
+    missing_columns = set(DAILY_DATA_COLUMNS).difference(data.columns)
     if missing_columns:
         missing = "、".join(sorted(missing_columns))
-        raise RuntimeError(f"{path} 缺少原始数据字段：{missing}。")
-    for field in DATA_COLUMNS:
-        if field.endswith(("_open", "_close", "_high", "_low", "_vol")):
-            data[field] = pd.to_numeric(data[field], errors="coerce")
-    return data.reindex(columns=DATA_COLUMNS)
+        raise RuntimeError(f"{path} 缺少日线数据字段：{missing}。")
+    for field in ("open", "close", "high", "low", "vol"):
+        data[field] = pd.to_numeric(data[field], errors="coerce")
+    data["ts_code"] = data["ts_code"].str.zfill(6)
+    return data.reindex(columns=DAILY_DATA_COLUMNS)
+
+
+def assemble_data_from_logs(
+    paths: list[Path], trading_days: list[str]
+) -> pd.DataFrame:
+    """Assemble three-day screen input from one all-stock snapshot per day."""
+    snapshots = [read_data_log(path) for path in paths]
+    for snapshot, trading_day in zip(snapshots, trading_days, strict=True):
+        dates = snapshot["trade_date"].dropna().astype(str).unique()
+        if len(dates) != 1 or dates[0] != trading_day:
+            raise RuntimeError(f"{trading_day} 的日线数据文件日期不匹配。")
+    stocks = snapshots[0].loc[:, ["ts_code", "name"]]
+    daily_bars = {
+        trading_day: snapshot.loc[:, DAILY_FIELDS]
+        for trading_day, snapshot in zip(trading_days, snapshots, strict=True)
+    }
+    return assemble_data(stocks, daily_bars, trading_days)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -318,7 +367,7 @@ def parse_arguments() -> argparse.Namespace:
         "--data-dir",
         type=Path,
         default=Path("data"),
-        help="完整 D0/D1/D2 原始数据 CSV 的目录（默认：data）。",
+        help="每日全市场 OHLCV CSV 的目录（默认：data）。",
     )
     parser.add_argument(
         "--refresh-data",
@@ -346,16 +395,16 @@ def main() -> int:
         ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
     pattern_date = trading_days[-1]
-    data_path = args.data_dir / f"{pattern_date}.csv"
-    if data_path.exists() and not args.refresh_data:
-        data = read_data_log(data_path)
-        print(f"复用本地原始数据 {data_path}，共 {len(data)} 只股票。")
+    data_paths = [args.data_dir / f"{trading_day}.csv" for trading_day in trading_days]
+    if all(path.exists() for path in data_paths) and not args.refresh_data:
+        data = assemble_data_from_logs(data_paths, trading_days)
+        print(f"复用本地日线数据，共 {len(data)} 只股票。")
     else:
         stocks = eligible_stocks(ak)
         daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
         data = assemble_data(stocks, daily_bars, trading_days)
         data_path = write_data_log(data, args.data_dir, pattern_date)
-        print(f"已写入原始数据 {data_path}，共 {len(data)} 只股票。")
+        print(f"已写入日线数据 {data_path}，共 {len(data)} 只股票。")
     result = screen_data(data)
     destination = write_results(result, args.output_dir, pattern_date)
     print(f"已写入 {destination}，共 {len(result)} 只股票。")
