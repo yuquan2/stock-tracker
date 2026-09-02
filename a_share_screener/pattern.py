@@ -34,14 +34,14 @@ def prices_equal(
     *,
     price_tick: float = PRICE_TICK,
 ) -> bool:
-    """Compare quoted prices within half of their minimum price increment."""
+    """Compare quoted prices within one minimum price increment."""
     if price_tick <= 0:
         raise ValueError("price_tick must be positive")
     return math.isclose(
         float(left),
         float(right),
         rel_tol=0.0,
-        abs_tol=price_tick / 2 + 1e-9,
+        abs_tol=price_tick + 1e-9,
     )
 
 

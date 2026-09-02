@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -9,13 +10,16 @@ from requests import ConnectionError
 
 from a_share_screener.pattern import is_excluded_stock, matches_pattern, prices_equal
 from a_share_screener.runner import (
+    assemble_data,
     completed_trading_days,
     eligible_stocks,
     fetch_daily_bars,
     fetch_stock_history,
     latest_completed_reference_date,
+    read_data_log,
     screen,
     write_results,
+    write_data_log,
 )
 
 
@@ -28,8 +32,8 @@ class PatternTests(unittest.TestCase):
     def test_matches_complete_pattern(self) -> None:
         self.assertTrue(matches_pattern(self.d0, self.d1, self.d2))
 
-    def test_accepts_half_tick_floating_point_difference(self) -> None:
-        self.d2["high"] = 10.505
+    def test_accepts_one_tick_price_difference(self) -> None:
+        self.d2["high"] = 10.51
         self.assertTrue(prices_equal(self.d2["high"], self.d1["close"]))
 
     def test_rejects_when_volume_threshold_is_not_met(self) -> None:
@@ -182,6 +186,49 @@ class AkShareAdapterTests(unittest.TestCase):
 
         self.assertEqual(RetryingAkShare.attempts, 2)
 
+    def test_retries_transient_history_parsing_error(self) -> None:
+        class RetryingAkShare:
+            attempts = 0
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                cls.attempts += 1
+                if cls.attempts == 1:
+                    raise IndexError("upstream response has no rows")
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
+                    }
+                )
+
+        fetch_stock_history(
+            RetryingAkShare(), "600001", ["20260826", "20260827", "20260828"]
+        )
+
+        self.assertEqual(RetryingAkShare.attempts, 2)
+
+    def test_skips_stock_without_available_tencent_history(self) -> None:
+        class MissingHistoryAkShare:
+            attempts = 0
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                cls.attempts += 1
+                raise IndexError("upstream response has no rows")
+
+        with patch("a_share_screener.runner.time.sleep"):
+            result = fetch_stock_history(
+                MissingHistoryAkShare(), "301688", ["20260826", "20260827", "20260828"]
+            )
+
+        self.assertTrue(result.empty)
+        self.assertEqual(MissingHistoryAkShare.attempts, 3)
+
 
 class ScreeningTests(unittest.TestCase):
     def test_screens_only_complete_matching_three_day_data(self) -> None:
@@ -243,6 +290,29 @@ class ScreeningTests(unittest.TestCase):
         self.assertEqual(result["ts_code"].tolist(), ["600001.SH"])
         self.assertEqual(result.loc[0, "pattern_date"], "20260828")
         self.assertEqual(result.loc[0, "d1_close"], 10.5)
+
+    def test_writes_and_reads_complete_data_log(self) -> None:
+        stocks = pd.DataFrame([{"ts_code": "600001", "name": "示例公司"}])
+        daily_bars = {
+            "20260826": pd.DataFrame(
+                [{"ts_code": "600001", "open": 9.8, "close": 10.0, "high": 10.1, "low": 9.7, "vol": 100}]
+            ),
+            "20260827": pd.DataFrame(
+                [{"ts_code": "600001", "open": 10.0, "close": 10.5, "high": 10.7, "low": 9.9, "vol": 150}]
+            ),
+            "20260828": pd.DataFrame(
+                [{"ts_code": "600001", "open": 10.2, "close": 10.3, "high": 10.5, "low": 10.0, "vol": 80}]
+            ),
+        }
+        data = assemble_data(stocks, daily_bars, ["20260826", "20260827", "20260828"])
+
+        with TemporaryDirectory() as directory:
+            destination = write_data_log(data, Path(directory), "20260828")
+            loaded = read_data_log(destination)
+
+        self.assertEqual(loaded.loc[0, "ts_code"], "600001")
+        self.assertEqual(loaded.loc[0, "d0_open"], 9.8)
+        self.assertEqual(loaded.loc[0, "d2_vol"], 80)
 
     def test_writes_chinese_csv_headers(self) -> None:
         result = pd.DataFrame(

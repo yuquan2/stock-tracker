@@ -17,6 +17,7 @@ from requests import RequestException
 from a_share_screener.pattern import is_excluded_stock, matches_pattern
 
 DAILY_FIELDS = ["ts_code", "open", "close", "high", "low", "vol"]
+BAR_FIELDS = DAILY_FIELDS[1:]
 HISTORY_REQUEST_ATTEMPTS = 3
 MARKET_DATA_COMPLETE_HOUR = 16
 RESULT_COLUMNS = [
@@ -48,6 +49,40 @@ CSV_COLUMN_NAMES = {
     "d2_date": "D2日期",
     "d2_high": "D2最高价",
     "d2_low": "D2最低价",
+}
+DATA_COLUMNS = [
+    "pattern_date",
+    "ts_code",
+    "name",
+    *[
+        field
+        for day in ("d0", "d1", "d2")
+        for field in (
+            f"{day}_date",
+            f"{day}_open",
+            f"{day}_close",
+            f"{day}_high",
+            f"{day}_low",
+            f"{day}_vol",
+        )
+    ],
+]
+DATA_CSV_COLUMN_NAMES = {
+    "pattern_date": "形态日期",
+    "ts_code": "股票代码",
+    "name": "股票名称",
+    **{
+        f"{day}_{field}": f"{day.upper()}{chinese_name}"
+        for day in ("d0", "d1", "d2")
+        for field, chinese_name in {
+            "date": "日期",
+            "open": "开盘价",
+            "close": "收盘价",
+            "high": "最高价",
+            "low": "最低价",
+            "vol": "成交量",
+        }.items()
+    },
 }
 
 
@@ -119,9 +154,15 @@ def fetch_stock_history(
                 adjust="",
             )
             break
-        except RequestException:
+        except (RequestException, IndexError) as error:
             if attempt == HISTORY_REQUEST_ATTEMPTS:
-                raise
+                if isinstance(error, IndexError):
+                    print(
+                        f"{ts_code} 无可用腾讯历史日线，已从本次筛选跳过。",
+                        file=sys.stderr,
+                    )
+                    return pd.DataFrame(columns=["trade_date", *DAILY_FIELDS])
+                raise RuntimeError(f"{ts_code} 历史日线请求连续失败。") from error
             print(
                 f"{ts_code} 历史日线请求失败，正在进行第 {attempt + 1} 次尝试。",
                 file=sys.stderr,
@@ -181,10 +222,10 @@ def fetch_daily_bars(
     }
 
 
-def screen(
+def assemble_data(
     stocks: pd.DataFrame, daily_bars: dict[str, pd.DataFrame], trading_days: list[str]
 ) -> pd.DataFrame:
-    """Screen only securities with all three daily bars present and valid."""
+    """Create a complete three-day OHLCV dataset for eligible securities."""
     d0_date, d1_date, d2_date = trading_days
     merged = stocks.copy()
     for label, trading_day in zip(("d0", "d1", "d2"), trading_days, strict=True):
@@ -192,52 +233,37 @@ def screen(
             columns={field: f"{label}_{field}" for field in DAILY_FIELDS if field != "ts_code"}
         )
         merged = merged.merge(bars, on="ts_code", how="inner", validate="one_to_one")
+        merged.insert(
+            merged.columns.get_loc(f"{label}_open"),
+            f"{label}_date",
+            trading_day,
+        )
+    merged.insert(0, "pattern_date", d2_date)
+    return merged.reindex(columns=DATA_COLUMNS)
 
-    matches = merged.apply(
+
+def screen_data(data: pd.DataFrame) -> pd.DataFrame:
+    """Apply the requested pattern to a complete three-day OHLCV dataset."""
+    matches = data.apply(
         lambda row: matches_pattern(
-            {
-                "open": row["d0_open"],
-                "close": row["d0_close"],
-                "high": row["d0_high"],
-                "low": row["d0_low"],
-                "vol": row["d0_vol"],
-            },
-            {
-                "open": row["d1_open"],
-                "close": row["d1_close"],
-                "high": row["d1_high"],
-                "low": row["d1_low"],
-                "vol": row["d1_vol"],
-            },
-            {
-                "open": row["d2_open"],
-                "close": row["d2_close"],
-                "high": row["d2_high"],
-                "low": row["d2_low"],
-                "vol": row["d2_vol"],
-            },
+            {field: row[f"d0_{field}"] for field in BAR_FIELDS},
+            {field: row[f"d1_{field}"] for field in BAR_FIELDS},
+            {field: row[f"d2_{field}"] for field in BAR_FIELDS},
         ),
         axis=1,
     )
-    result = merged.loc[
-        matches,
-        [
-            "ts_code",
-            "name",
-            "d0_vol",
-            "d1_open",
-            "d1_close",
-            "d1_high",
-            "d1_vol",
-            "d2_high",
-            "d2_low",
-        ],
-    ].copy()
-    result.insert(0, "pattern_date", d2_date)
-    result.insert(3, "d0_date", d0_date)
-    result.insert(5, "d1_date", d1_date)
-    result.insert(10, "d2_date", d2_date)
-    return result.reindex(columns=RESULT_COLUMNS).sort_values("ts_code").reset_index(drop=True)
+    return (
+        data.loc[matches, RESULT_COLUMNS]
+        .sort_values("ts_code")
+        .reset_index(drop=True)
+    )
+
+
+def screen(
+    stocks: pd.DataFrame, daily_bars: dict[str, pd.DataFrame], trading_days: list[str]
+) -> pd.DataFrame:
+    """Screen eligible stocks that have complete bars for all three days."""
+    return screen_data(assemble_data(stocks, daily_bars, trading_days))
 
 
 def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> Path:
@@ -252,6 +278,34 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
     return destination
 
 
+def write_data_log(data: pd.DataFrame, data_dir: Path, pattern_date: str) -> Path:
+    """Atomically persist the complete eligible universe for later local re-screening."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    destination = data_dir / f"{pattern_date}.csv"
+    temporary = destination.with_suffix(".csv.tmp")
+    data.reindex(columns=DATA_COLUMNS).rename(columns=DATA_CSV_COLUMN_NAMES).to_csv(
+        temporary, index=False, encoding="utf-8-sig"
+    )
+    temporary.replace(destination)
+    return destination
+
+
+def read_data_log(path: Path) -> pd.DataFrame:
+    """Load and validate a locally cached complete daily dataset."""
+    data = pd.read_csv(path, encoding="utf-8-sig", dtype={"股票代码": str})
+    data = data.rename(
+        columns={chinese_name: field for field, chinese_name in DATA_CSV_COLUMN_NAMES.items()}
+    )
+    missing_columns = set(DATA_COLUMNS).difference(data.columns)
+    if missing_columns:
+        missing = "、".join(sorted(missing_columns))
+        raise RuntimeError(f"{path} 缺少原始数据字段：{missing}。")
+    for field in DATA_COLUMNS:
+        if field.endswith(("_open", "_close", "_high", "_low", "_vol")):
+            data[field] = pd.to_numeric(data[field], errors="coerce")
+    return data.reindex(columns=DATA_COLUMNS)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="筛选 A 股三日形态。")
     parser.add_argument(
@@ -261,10 +315,21 @@ def parse_arguments() -> argparse.Namespace:
         help="结果 CSV 的目录（默认：results）。",
     )
     parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="完整 D0/D1/D2 原始数据 CSV 的目录（默认：data）。",
+    )
+    parser.add_argument(
+        "--refresh-data",
+        action="store_true",
+        help="即使存在同日期原始数据文件，也重新从数据源获取。",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
-        default=8,
-        help="并发获取历史日线的请求数（默认：8）。",
+        default=32,
+        help="并发获取历史日线的请求数（默认：32）。",
     )
     return parser.parse_args()
 
@@ -280,10 +345,19 @@ def main() -> int:
     trading_days = completed_trading_days(
         ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
-    stocks = eligible_stocks(ak)
-    daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
-    result = screen(stocks, daily_bars, trading_days)
-    destination = write_results(result, args.output_dir, trading_days[-1])
+    pattern_date = trading_days[-1]
+    data_path = args.data_dir / f"{pattern_date}.csv"
+    if data_path.exists() and not args.refresh_data:
+        data = read_data_log(data_path)
+        print(f"复用本地原始数据 {data_path}，共 {len(data)} 只股票。")
+    else:
+        stocks = eligible_stocks(ak)
+        daily_bars = fetch_daily_bars(ak, stocks, trading_days, args.workers)
+        data = assemble_data(stocks, daily_bars, trading_days)
+        data_path = write_data_log(data, args.data_dir, pattern_date)
+        print(f"已写入原始数据 {data_path}，共 {len(data)} 只股票。")
+    result = screen_data(data)
+    destination = write_results(result, args.output_dir, pattern_date)
     print(f"已写入 {destination}，共 {len(result)} 只股票。")
     return 0
 
