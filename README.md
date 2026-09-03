@@ -43,20 +43,6 @@ python -m a_share_screener.runner
 
 历史日线默认使用 8 个并发请求，每个请求超时为 30 秒。每只股票完成后会先写入 `data/.YYYYMMDD.partial.csv` 检查点；中断后的下一次运行会跳过已在三个检查点完成的股票。任务完成时才原子替换为正式 CSV，成功后删除检查点。
 
-## 历史数据校验与补齐
-
-先将腾讯现货列表中符合股票池规则的代码固化为快照，再倒序校验所有已有日线文件：
-
-```bash
-python -m a_share_screener.runner \
-  --update-stock-snapshot stock_snapshot/20260903.csv \
-  --reference-stock-file stock_snapshot/20260903.csv \
-  --validate-history-through 20260903 \
-  --workers 4
-```
-
-每个日期先移除重复代码；仅对缺失代码请求数据。每次请求会获取截至该日期的过去一年日线并保存至本地临时缓存 `data/.history-cache/`，后续日期优先复用缓存。每个日期完成后立即按股票代码排序并原子写回 CSV，终端会显示文件级进度及单日期请求进度条。无可用日线的股票会保留为该日期缺口，不会写入伪造数据。
-
 运行不访问网络的单元测试：
 
 ```bash

@@ -117,23 +117,13 @@ def fetch_stock_history(
     ak: Any, ts_code: str, trading_days: list[str]
 ) -> pd.DataFrame:
     """Fetch one stock's unadjusted bars, retaining only the target days."""
-    history = fetch_stock_history_range(
-        ak, ts_code, trading_days[0], trading_days[-1]
-    )
-    return history.loc[history["trade_date"].isin(trading_days)].copy()
-
-
-def fetch_stock_history_range(
-    ak: Any, ts_code: str, start_date: str, end_date: str
-) -> pd.DataFrame:
-    """Fetch one stock's unadjusted bars for an inclusive date range."""
     exchange_prefix = "sh" if ts_code.startswith("6") else "sz"
     for attempt in range(1, HISTORY_REQUEST_ATTEMPTS + 1):
         try:
             history = ak.stock_zh_a_hist_tx(
                 symbol=f"{exchange_prefix}{ts_code}",
-                start_date=start_date,
-                end_date=end_date,
+                start_date=trading_days[0],
+                end_date=trading_days[-1],
                 adjust="",
                 timeout=HISTORY_REQUEST_TIMEOUT_SECONDS,
             )
@@ -168,6 +158,7 @@ def fetch_stock_history_range(
         history["trade_date"], errors="coerce"
     ).dt.strftime("%Y%m%d")
     history.insert(1, "ts_code", ts_code)
+    history = history.loc[history["trade_date"].isin(trading_days)].copy()
     if history["trade_date"].duplicated().any():
         raise RuntimeError(f"{ts_code} 历史日线数据存在重复交易日，已停止筛选。")
     for field in DAILY_FIELDS[1:]:
@@ -387,8 +378,8 @@ def append_data_checkpoint(snapshot: pd.DataFrame, checkpoint: Path) -> None:
     )
 
 
-def load_stock_reference(path: Path) -> pd.DataFrame:
-    """Load the fixed stock universe used to validate historical snapshots."""
+def load_stock_snapshot(path: Path) -> pd.DataFrame:
+    """Load a fixed eligible-stock universe snapshot."""
     reference = pd.read_csv(path, encoding="utf-8-sig", dtype={"股票代码": str})
     required_columns = {"股票代码", "股票名称"}
     missing_columns = required_columns.difference(reference.columns)
@@ -398,7 +389,7 @@ def load_stock_reference(path: Path) -> pd.DataFrame:
     reference = reference.rename(columns={"股票代码": "ts_code", "股票名称": "name"})
     reference["ts_code"] = reference["ts_code"].str.zfill(6)
     if reference["ts_code"].duplicated().any():
-        raise RuntimeError(f"{path} 的股票代码存在重复，无法作为校验基准。")
+        raise RuntimeError(f"{path} 的股票代码存在重复，无法作为股票池快照。")
     return reference.loc[:, ["ts_code", "name"]]
 
 
@@ -417,172 +408,19 @@ def write_stock_snapshot(stocks: pd.DataFrame, path: Path, snapshot_date: str) -
     return path
 
 
-def _progress_bar(completed: int, total: int, width: int = 24) -> str:
-    """Render a fixed-width terminal progress bar."""
-    filled = width if total == 0 else width * completed // total
-    return f"[{'#' * filled}{'-' * (width - filled)}] {completed}/{total}"
-
-
-def _cache_path(cache_dir: Path, ts_code: str, end_date: str) -> Path:
-    return cache_dir / f"{ts_code}-{end_date}.csv"
-
-
-def _cached_history_for_date(
-    cache_dir: Path, ts_code: str, trading_day: str
-) -> pd.DataFrame | None:
-    """Return a cached annual history when its coverage includes the target day."""
-    candidates = sorted(cache_dir.glob(f"{ts_code}-????????.csv"), reverse=True)
-    for path in candidates:
-        end_date = path.stem.rsplit("-", maxsplit=1)[1]
-        start_date = (datetime.strptime(end_date, "%Y%m%d").date() - timedelta(days=365)).strftime("%Y%m%d")
-        if start_date <= trading_day <= end_date:
-            return pd.read_csv(path, dtype={"ts_code": str}).reindex(columns=["trade_date", *DAILY_FIELDS])
-    return None
-
-
-def _fetch_and_cache_annual_history(
-    ak: Any, cache_dir: Path, ts_code: str, trading_day: str
-) -> pd.DataFrame:
-    """Fetch a year ending on a missing date and atomically cache its raw bars."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    end_date = datetime.strptime(trading_day, "%Y%m%d").date()
-    start_date = end_date - timedelta(days=365)
-    history = fetch_stock_history_range(
-        ak, ts_code, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
-    )
-    cache_path = _cache_path(cache_dir, ts_code, trading_day)
-    temporary = cache_path.with_suffix(".csv.tmp")
-    history.to_csv(temporary, index=False)
-    temporary.replace(cache_path)
-    return history
-
-
-def validate_historical_data_logs(
-    ak: Any,
-    data_dir: Path,
-    reference_path: Path,
-    through_date: str,
-    workers: int,
-    *,
-    cache_dir: Path | None = None,
-) -> None:
-    """Repair missing reference stocks in cached snapshots through a cutoff date."""
-    if workers < 1:
-        raise ValueError("workers must be at least 1")
-    if len(through_date) != 8 or not through_date.isdigit():
-        raise ValueError("through_date must use YYYYMMDD format")
-
-    reference = load_stock_reference(reference_path)
-    reference_codes = set(reference["ts_code"])
-    cache_dir = cache_dir or data_dir / ".history-cache"
-    paths = sorted(
-        (
-            path
-            for path in data_dir.glob("????????.csv")
-            if path.stem <= through_date
-        ),
-        reverse=True,
-    )
-    if not paths:
-        raise RuntimeError(f"{data_dir} 中没有 {through_date} 或更早的日线数据文件。")
-
-    for file_index, path in enumerate(paths, start=1):
-        trading_day = path.stem
-        snapshot = read_data_log(path)
-        dates = snapshot["trade_date"].dropna().astype(str).unique()
-        if len(dates) != 1 or dates[0] != trading_day:
-            raise RuntimeError(f"{path} 的日线数据文件日期不匹配。")
-        duplicates = snapshot["ts_code"].duplicated(keep="first")
-        duplicate_count = int(duplicates.sum())
-        snapshot = snapshot.loc[~duplicates].copy()
-
-        checkpoint = data_dir / f".{trading_day}.repair.partial.csv"
-        recovered = (
-            read_data_log(checkpoint)
-            if checkpoint.exists()
-            else pd.DataFrame(columns=DAILY_DATA_COLUMNS)
-        )
-        if recovered["ts_code"].duplicated().any():
-            raise RuntimeError(f"{checkpoint} 的股票代码存在重复。")
-        completed_codes = set(snapshot["ts_code"]) | set(recovered["ts_code"])
-        missing_codes = sorted(reference_codes - completed_codes)
-        names = reference.set_index("ts_code")["name"]
-        cached_histories: list[pd.DataFrame] = []
-        codes_to_query = []
-        for code in missing_codes:
-            cached_history = _cached_history_for_date(cache_dir, code, trading_day)
-            if cached_history is None:
-                codes_to_query.append(code)
-            else:
-                cached_histories.append(cached_history)
-        for history in cached_histories:
-            daily_history = history.loc[
-                history["trade_date"].astype(str) == trading_day, DAILY_FIELDS
-            ]
-            if not daily_history.empty:
-                append_data_checkpoint(
-                    daily_history.assign(name=daily_history["ts_code"].map(names)).reindex(
-                        columns=DAILY_DATA_COLUMNS
-                    ),
-                    checkpoint,
-                )
-
-        print(
-            f"\n[{file_index}/{len(paths)}] 校验 {trading_day}："
-            f"重复 {duplicate_count}，缓存补查 {len(cached_histories)}，"
-            f"待查询 {len(codes_to_query)}。"
-        )
-        if codes_to_query:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(
-                        _fetch_and_cache_annual_history,
-                        ak,
-                        cache_dir,
-                        code,
-                        trading_day,
-                    ): code
-                    for code in codes_to_query
-                }
-                for completed, future in enumerate(as_completed(futures), start=1):
-                    history = future.result()
-                    if not history.empty:
-                        history = history.loc[
-                            history["trade_date"] == trading_day, DAILY_FIELDS
-                        ]
-                        if not history.empty:
-                            append_data_checkpoint(
-                                history.assign(
-                                    name=history["ts_code"].map(names)
-                                ).reindex(columns=DAILY_DATA_COLUMNS),
-                                checkpoint,
-                            )
-                    print(
-                        f"\r{trading_day} {_progress_bar(completed, len(futures))}",
-                        end="",
-                        flush=True,
-                    )
-            print()
-
-        recovered = (
-            read_data_log(checkpoint)
-            if checkpoint.exists()
-            else pd.DataFrame(columns=DAILY_DATA_COLUMNS)
-        )
-        combined = (
-            pd.concat([snapshot, recovered], ignore_index=True)
-            if not recovered.empty
-            else snapshot
-        )
-        if combined["ts_code"].duplicated().any():
-            raise RuntimeError(f"{trading_day} 合并后的日线数据存在重复股票代码。")
-        write_daily_data_log(combined, data_dir, trading_day)
-        checkpoint.unlink(missing_ok=True)
-        remaining = len(reference_codes - set(combined["ts_code"]))
-        print(
-            f"已写入日线数据 {path}，共 {len(combined)} 只股票；"
-            f"相对基准仍缺 {remaining} 只。"
-        )
+def sync_stock_snapshot(
+    stocks: pd.DataFrame, snapshot_dir: Path, snapshot_date: str
+) -> Path | None:
+    """Create a dated snapshot when the current stock universe has changed."""
+    snapshots = sorted(snapshot_dir.glob("????????.csv"))
+    if snapshots:
+        latest = load_stock_snapshot(snapshots[-1]).sort_values(
+            "ts_code", kind="stable"
+        ).reset_index(drop=True)
+        current = stocks.sort_values("ts_code", kind="stable").reset_index(drop=True)
+        if latest.equals(current):
+            return None
+    return write_stock_snapshot(stocks, snapshot_dir / f"{snapshot_date}.csv", snapshot_date)
 
 
 def populate_missing_data_logs(
@@ -592,6 +430,7 @@ def populate_missing_data_logs(
     workers: int,
     *,
     refresh_data: bool = False,
+    stocks: pd.DataFrame | None = None,
 ) -> list[Path]:
     """Fetch and persist only the requested daily snapshots absent from the cache."""
     data_paths = [data_dir / f"{trading_day}.csv" for trading_day in trading_days]
@@ -603,7 +442,7 @@ def populate_missing_data_logs(
     if not days_to_fetch:
         return data_paths
 
-    stocks = eligible_stocks(ak)
+    stocks = stocks if stocks is not None else eligible_stocks(ak)
     checkpoint_bars: dict[str, pd.DataFrame] = {}
     completed_codes: set[str] | None = None
     for trading_day in days_to_fetch:
@@ -706,23 +545,6 @@ def parse_arguments() -> argparse.Namespace:
         default=8,
         help="并发获取历史日线的请求数（默认：8）。",
     )
-    parser.add_argument(
-        "--validate-history-through",
-        metavar="YYYYMMDD",
-        help="倒序校验并补齐该日期及更早的日线数据。",
-    )
-    parser.add_argument(
-        "--reference-stock-file",
-        type=Path,
-        default=Path("stock_snapshot/20260902.csv"),
-        help="历史校验使用的固定股票池 CSV（默认：stock_snapshot/20260902.csv）。",
-    )
-    parser.add_argument(
-        "--update-stock-snapshot",
-        type=Path,
-        metavar="PATH",
-        help="从腾讯现货列表更新指定路径的固定股票池快照。",
-    )
     return parser.parse_args()
 
 
@@ -733,33 +555,22 @@ def main() -> int:
 
     import akshare as ak
 
-    if args.update_stock_snapshot:
-        stocks = eligible_stocks(ak)
-        snapshot_date = args.update_stock_snapshot.stem
-        destination = write_stock_snapshot(stocks, args.update_stock_snapshot, snapshot_date)
-        print(f"已更新股票池快照 {destination}，共 {len(stocks)} 只股票。")
-
-    if args.validate_history_through:
-        validate_historical_data_logs(
-            ak,
-            args.data_dir,
-            args.reference_stock_file,
-            args.validate_history_through,
-            args.workers,
-        )
-        return 0
-
     shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     trading_days = completed_trading_days(
         ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
     pattern_date = trading_days[-1]
+    stocks = eligible_stocks(ak)
+    snapshot_path = sync_stock_snapshot(stocks, Path("stock_snapshot"), pattern_date)
+    if snapshot_path is not None:
+        print(f"已更新股票池快照 {snapshot_path}，共 {len(stocks)} 只股票。")
     data_paths = populate_missing_data_logs(
         ak,
         args.data_dir,
         trading_days,
         args.workers,
         refresh_data=args.refresh_data,
+        stocks=stocks,
     )
     data = assemble_data_from_logs(data_paths, trading_days)
     print(f"复用本地日线数据，共 {len(data)} 只股票。")

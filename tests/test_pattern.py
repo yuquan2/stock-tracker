@@ -16,14 +16,12 @@ from a_share_screener.runner import (
     completed_trading_days,
     eligible_stocks,
     fetch_daily_bars,
-    fetch_stock_history_range,
     fetch_stock_history,
     latest_completed_reference_date,
-    load_stock_reference,
     populate_missing_data_logs,
     read_data_log,
     screen,
-    validate_historical_data_logs,
+    sync_stock_snapshot,
     write_daily_data_log,
     write_results,
     write_data_log,
@@ -168,29 +166,6 @@ class AkShareAdapterTests(unittest.TestCase):
 
         self.assertEqual(result["trade_date"].tolist(), ["20260826", "20260827", "20260828"])
         self.assertEqual(result["ts_code"].tolist(), ["600001", "600001", "600001"])
-
-    def test_fetches_full_requested_history_range(self) -> None:
-        class HistoryAkShare:
-            @staticmethod
-            def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
-                self.assertEqual(kwargs["start_date"], "20250828")
-                self.assertEqual(kwargs["end_date"], "20260828")
-                return pd.DataFrame(
-                    {
-                        "date": ["2025-08-28", "2026-08-28"],
-                        "open": [9.8, 10.2],
-                        "close": [10.0, 10.3],
-                        "high": [10.1, 10.5],
-                        "low": [9.7, 10.0],
-                        "volume": [100, 80],
-                    }
-                )
-
-        result = fetch_stock_history_range(
-            HistoryAkShare(), "600001", "20250828", "20260828"
-        )
-
-        self.assertEqual(result["trade_date"].tolist(), ["20250828", "20260828"])
 
     def test_converts_sz000_history_volume_from_lots_to_shares(self) -> None:
         class HistoryAkShare:
@@ -508,55 +483,6 @@ class ScreeningTests(unittest.TestCase):
 
         self.assertEqual(written["ts_code"].tolist(), ["000001", "600002"])
 
-    def test_repairs_missing_stock_and_removes_duplicate_from_history(self) -> None:
-        class HistoryAkShare:
-            @staticmethod
-            def stock_zh_a_hist_tx(**kwargs: str) -> pd.DataFrame:
-                self.assertEqual(kwargs["symbol"], "sh600002")
-                self.assertEqual(kwargs["start_date"], "20250828")
-                self.assertEqual(kwargs["end_date"], "20260828")
-                return pd.DataFrame(
-                    {
-                        "date": ["2026-08-28"],
-                        "open": [10.2],
-                        "close": [10.3],
-                        "high": [10.5],
-                        "low": [10.0],
-                        "volume": [80],
-                    }
-                )
-
-        with TemporaryDirectory() as directory:
-            data_dir = Path(directory)
-            pd.DataFrame(
-                [
-                    {"日期": "20260828", "股票代码": "600001", "股票名称": "甲", "开盘价": 1, "收盘价": 1, "最高价": 1, "最低价": 1, "成交量(股)": 1},
-                    {"日期": "20260828", "股票代码": "600001", "股票名称": "甲", "开盘价": 2, "收盘价": 2, "最高价": 2, "最低价": 2, "成交量(股)": 2},
-                ]
-            ).to_csv(data_dir / "20260828.csv", index=False, encoding="utf-8-sig")
-            reference_path = data_dir / "reference.csv"
-            pd.DataFrame(
-                [{"股票代码": "600001", "股票名称": "甲"}, {"股票代码": "600002", "股票名称": "乙"}]
-            ).to_csv(reference_path, index=False, encoding="utf-8-sig")
-
-            validate_historical_data_logs(
-                HistoryAkShare(), data_dir, reference_path, "20260828", workers=4
-            )
-            repaired = read_data_log(data_dir / "20260828.csv")
-
-        self.assertEqual(repaired["ts_code"].tolist(), ["600001", "600002"])
-        self.assertEqual(repaired.loc[1, "name"], "乙")
-
-    def test_rejects_duplicate_reference_stock_codes(self) -> None:
-        with TemporaryDirectory() as directory:
-            reference_path = Path(directory) / "reference.csv"
-            pd.DataFrame(
-                [{"股票代码": "600001", "股票名称": "甲"}, {"股票代码": "600001", "股票名称": "乙"}]
-            ).to_csv(reference_path, index=False, encoding="utf-8-sig")
-
-            with self.assertRaisesRegex(RuntimeError, "存在重复"):
-                load_stock_reference(reference_path)
-
     def test_writes_sorted_stock_snapshot(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "20260903.csv"
@@ -576,6 +502,38 @@ class ScreeningTests(unittest.TestCase):
 
         self.assertEqual(snapshot["股票代码"].tolist(), ["000001", "600001"])
         self.assertEqual(snapshot["日期"].tolist(), ["20260903", "20260903"])
+
+    def test_creates_snapshot_when_stock_universe_changes(self) -> None:
+        with TemporaryDirectory() as directory:
+            snapshot_dir = Path(directory)
+            write_stock_snapshot(
+                pd.DataFrame([{"ts_code": "600001", "name": "甲"}]),
+                snapshot_dir / "20260902.csv",
+                "20260902",
+            )
+            destination = sync_stock_snapshot(
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001", "name": "乙"},
+                        {"ts_code": "600001", "name": "甲"},
+                    ]
+                ),
+                snapshot_dir,
+                "20260903",
+            )
+            unchanged = sync_stock_snapshot(
+                pd.DataFrame(
+                    [
+                        {"ts_code": "600001", "name": "甲"},
+                        {"ts_code": "000001", "name": "乙"},
+                    ]
+                ),
+                snapshot_dir,
+                "20260903",
+            )
+
+        self.assertEqual(destination, snapshot_dir / "20260903.csv")
+        self.assertIsNone(unchanged)
 
     def test_writes_chinese_csv_headers(self) -> None:
         result = pd.DataFrame(
