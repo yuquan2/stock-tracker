@@ -283,8 +283,8 @@ def screen(
 
 def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> Path:
     """Atomically replace the dated CSV only after all API data passed validation."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{pattern_date}.csv"
+    destination = output_dir / pattern_date[:4] / pattern_date[4:6] / f"{pattern_date}.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".csv.tmp")
     result = result.copy()
     result_headers = {

@@ -506,6 +506,10 @@ class ScreeningTests(unittest.TestCase):
             written = pd.read_csv(destination, encoding="utf-8-sig")
 
         self.assertEqual(
+            destination,
+            Path(directory) / "2026" / "09" / "20260901.csv",
+        )
+        self.assertEqual(
             written.columns.tolist(),
             [
                 "形态日期",
