@@ -364,13 +364,63 @@ def append_daily_data_checkpoint(
     )
     for trading_day, daily_snapshot in snapshot.groupby("trade_date"):
         checkpoint = data_dir / f".{trading_day}.partial.csv"
-        daily_snapshot.rename(columns=DATA_CSV_COLUMN_NAMES).to_csv(
-            checkpoint,
-            mode="a",
-            header=not checkpoint.exists(),
-            index=False,
-            encoding="utf-8-sig",
-        )
+        append_data_checkpoint(daily_snapshot, checkpoint)
+
+
+def append_data_checkpoint(snapshot: pd.DataFrame, checkpoint: Path) -> None:
+    """Append normalized rows to a single-date checkpoint."""
+    snapshot.rename(columns=DATA_CSV_COLUMN_NAMES).to_csv(
+        checkpoint,
+        mode="a",
+        header=not checkpoint.exists(),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def load_stock_snapshot(path: Path) -> pd.DataFrame:
+    """Load a fixed eligible-stock universe snapshot."""
+    reference = pd.read_csv(path, encoding="utf-8-sig", dtype={"股票代码": str})
+    required_columns = {"股票代码", "股票名称"}
+    missing_columns = required_columns.difference(reference.columns)
+    if missing_columns:
+        missing = "、".join(sorted(missing_columns))
+        raise RuntimeError(f"{path} 缺少股票池字段：{missing}。")
+    reference = reference.rename(columns={"股票代码": "ts_code", "股票名称": "name"})
+    reference["ts_code"] = reference["ts_code"].str.zfill(6)
+    if reference["ts_code"].duplicated().any():
+        raise RuntimeError(f"{path} 的股票代码存在重复，无法作为股票池快照。")
+    return reference.loc[:, ["ts_code", "name"]]
+
+
+def write_stock_snapshot(stocks: pd.DataFrame, path: Path, snapshot_date: str) -> Path:
+    """Persist a sorted fixed eligible-stock universe snapshot."""
+    if len(snapshot_date) != 8 or not snapshot_date.isdigit():
+        raise ValueError("snapshot_date must use YYYYMMDD format")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".csv.tmp")
+    stocks.assign(日期=snapshot_date).rename(
+        columns={"ts_code": "股票代码", "name": "股票名称"}
+    ).loc[:, ["日期", "股票代码", "股票名称"]].sort_values(
+        "股票代码", kind="stable"
+    ).to_csv(temporary, index=False, encoding="utf-8-sig")
+    temporary.replace(path)
+    return path
+
+
+def sync_stock_snapshot(
+    stocks: pd.DataFrame, snapshot_dir: Path, snapshot_date: str
+) -> Path | None:
+    """Create a dated snapshot when the current stock universe has changed."""
+    snapshots = sorted(snapshot_dir.glob("????????.csv"))
+    if snapshots:
+        latest = load_stock_snapshot(snapshots[-1]).sort_values(
+            "ts_code", kind="stable"
+        ).reset_index(drop=True)
+        current = stocks.sort_values("ts_code", kind="stable").reset_index(drop=True)
+        if latest.equals(current):
+            return None
+    return write_stock_snapshot(stocks, snapshot_dir / f"{snapshot_date}.csv", snapshot_date)
 
 
 def populate_missing_data_logs(
@@ -380,6 +430,7 @@ def populate_missing_data_logs(
     workers: int,
     *,
     refresh_data: bool = False,
+    stocks: pd.DataFrame | None = None,
 ) -> list[Path]:
     """Fetch and persist only the requested daily snapshots absent from the cache."""
     data_paths = [data_dir / f"{trading_day}.csv" for trading_day in trading_days]
@@ -391,7 +442,7 @@ def populate_missing_data_logs(
     if not days_to_fetch:
         return data_paths
 
-    stocks = eligible_stocks(ak)
+    stocks = stocks if stocks is not None else eligible_stocks(ak)
     checkpoint_bars: dict[str, pd.DataFrame] = {}
     completed_codes: set[str] | None = None
     for trading_day in days_to_fetch:
@@ -509,12 +560,17 @@ def main() -> int:
         ak, reference_date=latest_completed_reference_date(shanghai_now)
     )
     pattern_date = trading_days[-1]
+    stocks = eligible_stocks(ak)
+    snapshot_path = sync_stock_snapshot(stocks, Path("stock_snapshot"), pattern_date)
+    if snapshot_path is not None:
+        print(f"已更新股票池快照 {snapshot_path}，共 {len(stocks)} 只股票。")
     data_paths = populate_missing_data_logs(
         ak,
         args.data_dir,
         trading_days,
         args.workers,
         refresh_data=args.refresh_data,
+        stocks=stocks,
     )
     data = assemble_data_from_logs(data_paths, trading_days)
     print(f"复用本地日线数据，共 {len(data)} 只股票。")

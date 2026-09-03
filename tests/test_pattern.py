@@ -21,9 +21,11 @@ from a_share_screener.runner import (
     populate_missing_data_logs,
     read_data_log,
     screen,
+    sync_stock_snapshot,
     write_daily_data_log,
     write_results,
     write_data_log,
+    write_stock_snapshot,
 )
 
 
@@ -480,6 +482,58 @@ class ScreeningTests(unittest.TestCase):
             written = read_data_log(destination)
 
         self.assertEqual(written["ts_code"].tolist(), ["000001", "600002"])
+
+    def test_writes_sorted_stock_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "20260903.csv"
+            write_stock_snapshot(
+                pd.DataFrame(
+                    [
+                        {"ts_code": "600001", "name": "乙"},
+                        {"ts_code": "000001", "name": "甲"},
+                    ]
+                ),
+                path,
+                "20260903",
+            )
+            snapshot = pd.read_csv(
+                path, encoding="utf-8-sig", dtype={"日期": str, "股票代码": str}
+            )
+
+        self.assertEqual(snapshot["股票代码"].tolist(), ["000001", "600001"])
+        self.assertEqual(snapshot["日期"].tolist(), ["20260903", "20260903"])
+
+    def test_creates_snapshot_when_stock_universe_changes(self) -> None:
+        with TemporaryDirectory() as directory:
+            snapshot_dir = Path(directory)
+            write_stock_snapshot(
+                pd.DataFrame([{"ts_code": "600001", "name": "甲"}]),
+                snapshot_dir / "20260902.csv",
+                "20260902",
+            )
+            destination = sync_stock_snapshot(
+                pd.DataFrame(
+                    [
+                        {"ts_code": "000001", "name": "乙"},
+                        {"ts_code": "600001", "name": "甲"},
+                    ]
+                ),
+                snapshot_dir,
+                "20260903",
+            )
+            unchanged = sync_stock_snapshot(
+                pd.DataFrame(
+                    [
+                        {"ts_code": "600001", "name": "甲"},
+                        {"ts_code": "000001", "name": "乙"},
+                    ]
+                ),
+                snapshot_dir,
+                "20260903",
+            )
+
+        self.assertEqual(destination, snapshot_dir / "20260903.csv")
+        self.assertIsNone(unchanged)
 
     def test_writes_chinese_csv_headers(self) -> None:
         result = pd.DataFrame(
