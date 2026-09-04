@@ -128,11 +128,12 @@ def fetch_stock_history(
                 timeout=HISTORY_REQUEST_TIMEOUT_SECONDS,
             )
             break
-        except (RequestException, IndexError) as error:
+        except (RequestException, IndexError, KeyError) as error:
             if attempt == HISTORY_REQUEST_ATTEMPTS:
-                if isinstance(error, IndexError):
+                if isinstance(error, (IndexError, KeyError)):
                     print(
-                        f"{ts_code} 无可用腾讯历史日线，已从本次筛选跳过。",
+                        f"{ts_code} 腾讯历史日线不可用或格式异常"
+                        f"（{error!s}），已从本次筛选跳过。",
                         file=sys.stderr,
                     )
                     return pd.DataFrame(columns=["trade_date", *DAILY_FIELDS])

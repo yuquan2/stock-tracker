@@ -240,6 +240,34 @@ class AkShareAdapterTests(unittest.TestCase):
 
         self.assertEqual(RetryingAkShare.attempts, 2)
 
+    def test_retries_transient_history_missing_day_error(self) -> None:
+        class RetryingAkShare:
+            attempts = 0
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                cls.attempts += 1
+                if cls.attempts == 1:
+                    raise KeyError("day")
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
+                    }
+                )
+
+        with patch("a_share_screener.runner.time.sleep"):
+            result = fetch_stock_history(
+                RetryingAkShare(), "600001", ["20260826", "20260827", "20260828"]
+            )
+
+        self.assertFalse(result.empty)
+        self.assertEqual(RetryingAkShare.attempts, 2)
+
     def test_skips_stock_without_available_tencent_history(self) -> None:
         class MissingHistoryAkShare:
             attempts = 0
@@ -256,6 +284,44 @@ class AkShareAdapterTests(unittest.TestCase):
 
         self.assertTrue(result.empty)
         self.assertEqual(MissingHistoryAkShare.attempts, 3)
+
+    def test_skips_malformed_tencent_history_without_stopping_other_stocks(self) -> None:
+        class MixedHistoryAkShare:
+            failed_attempts = 0
+
+            @classmethod
+            def stock_zh_a_hist_tx(cls, **kwargs: str) -> pd.DataFrame:
+                if kwargs["symbol"] == "sh600001":
+                    cls.failed_attempts += 1
+                    raise KeyError("day")
+                return pd.DataFrame(
+                    {
+                        "date": ["2026-08-26", "2026-08-27", "2026-08-28"],
+                        "open": [9.8, 10.0, 10.2],
+                        "close": [10.0, 10.5, 10.3],
+                        "high": [10.1, 10.7, 10.5],
+                        "low": [9.7, 9.9, 10.0],
+                        "volume": [100, 150, 80],
+                    }
+                )
+
+        with patch("a_share_screener.runner.time.sleep"):
+            bars = fetch_daily_bars(
+                MixedHistoryAkShare(),
+                pd.DataFrame(
+                    [
+                        {"ts_code": "600001", "name": "异常公司"},
+                        {"ts_code": "600002", "name": "正常公司"},
+                    ]
+                ),
+                ["20260826", "20260827", "20260828"],
+                workers=1,
+            )
+
+        self.assertEqual(MixedHistoryAkShare.failed_attempts, 3)
+        self.assertTrue(
+            all(frame["ts_code"].tolist() == ["600002"] for frame in bars.values())
+        )
 
 
 class ScreeningTests(unittest.TestCase):
