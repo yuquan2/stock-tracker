@@ -38,9 +38,15 @@ class PatternTests(unittest.TestCase):
     def test_matches_complete_pattern(self) -> None:
         self.assertTrue(matches_pattern(self.d0, self.d1, self.d2))
 
-    def test_accepts_one_tick_price_difference(self) -> None:
+    def test_rejects_one_tick_price_difference(self) -> None:
         self.d2["high"] = 10.51
-        self.assertTrue(prices_equal(self.d2["high"], self.d1["close"]))
+        self.assertFalse(prices_equal(self.d2["high"], self.d1["close"]))
+        self.assertFalse(matches_pattern(self.d0, self.d1, self.d2))
+
+    def test_rejects_one_tick_price_difference_below(self) -> None:
+        self.d2["high"] = 10.49
+        self.assertFalse(prices_equal(self.d2["high"], self.d1["close"]))
+        self.assertFalse(matches_pattern(self.d0, self.d1, self.d2))
 
     def test_rejects_when_volume_threshold_is_not_met(self) -> None:
         self.d1["vol"] = 149.99

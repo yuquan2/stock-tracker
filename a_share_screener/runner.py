@@ -526,8 +526,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results"),
-        help="结果 CSV 的目录（默认：results）。",
+        default=Path("results-exact"),
+        help="结果 CSV 的目录（默认：results-exact）。",
     )
     parser.add_argument(
         "--data-dir",
