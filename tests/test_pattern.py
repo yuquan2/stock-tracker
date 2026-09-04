@@ -630,6 +630,10 @@ class ScreeningTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             destination = write_results(result, Path(directory), "20260901")
             written = pd.read_csv(destination, encoding="utf-8-sig")
+            empty_destination = write_results(
+                result.iloc[0:0], Path(directory), "20260901"
+            )
+            self.assertFalse(destination.exists())
 
         self.assertEqual(
             destination,
@@ -649,6 +653,10 @@ class ScreeningTests(unittest.TestCase):
                 "D2(0901)最高价",
                 "D2(0901)最低价",
             ],
+        )
+        self.assertEqual(
+            empty_destination,
+            Path(directory) / "2026" / "09" / "20260901-empty.csv",
         )
 
 

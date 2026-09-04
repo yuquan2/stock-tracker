@@ -284,7 +284,12 @@ def screen(
 
 def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> Path:
     """Atomically replace the dated CSV only after all API data passed validation."""
-    destination = output_dir / pattern_date[:4] / pattern_date[4:6] / f"{pattern_date}.csv"
+    suffix = "-empty" if result.empty else ""
+    destination = (
+        output_dir / pattern_date[:4] / pattern_date[4:6] / f"{pattern_date}{suffix}.csv"
+    )
+    alternate_suffix = "" if suffix else "-empty"
+    alternate = destination.with_name(f"{pattern_date}{alternate_suffix}.csv")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".csv.tmp")
     result = result.copy()
@@ -314,6 +319,7 @@ def write_results(result: pd.DataFrame, output_dir: Path, pattern_date: str) -> 
         temporary, index=False, encoding="utf-8-sig"
     )
     temporary.replace(destination)
+    alternate.unlink(missing_ok=True)
     return destination
 
 
