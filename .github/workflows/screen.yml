@@ -39,5 +39,15 @@ jobs:
           git add -- data/ results/
           if ! git diff --cached --quiet; then
             git commit -m "chore: update A-share screening results"
-            git push
+            for attempt in 1 2 3; do
+              if git push; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "git push failed after ${attempt} attempts." >&2
+                exit 1
+              fi
+              echo "git push failed on attempt ${attempt}; retrying in 10 seconds..." >&2
+              sleep 10
+            done
           fi
