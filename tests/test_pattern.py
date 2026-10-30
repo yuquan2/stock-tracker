@@ -32,7 +32,7 @@ from a_share_screener.runner import (
 class PatternTests(unittest.TestCase):
     def setUp(self) -> None:
         self.d0 = {"open": 9.8, "close": 10.0, "high": 10.1, "low": 9.7, "vol": 100}
-        self.d1 = {"open": 10.0, "close": 10.5, "high": 10.7, "low": 9.9, "vol": 150}
+        self.d1 = {"open": 10.0, "close": 10.5, "high": 10.7, "low": 9.9, "vol": 190}
         self.d2 = {"open": 10.2, "close": 10.3, "high": 10.5, "low": 10.0, "vol": 80}
 
     def test_matches_complete_pattern(self) -> None:
@@ -49,7 +49,7 @@ class PatternTests(unittest.TestCase):
         self.assertFalse(matches_pattern(self.d0, self.d1, self.d2))
 
     def test_rejects_when_volume_threshold_is_not_met(self) -> None:
-        self.d1["vol"] = 149.99
+        self.d1["vol"] = 189.99
         self.assertFalse(matches_pattern(self.d0, self.d1, self.d2))
 
     def test_rejects_when_second_day_prices_do_not_match(self) -> None:
@@ -367,7 +367,7 @@ class ScreeningTests(unittest.TestCase):
                         "close": 10.5,
                         "high": 10.7,
                         "low": 9.9,
-                        "vol": 150,
+                        "vol": 190,
                     }
                 ]
             ),
