@@ -61,7 +61,7 @@ def matches_pattern(
 
     return (
         d1_close > d1_open
-        and d1_volume >= 1.5 * d0_volume
+        and d1_volume >= 1.9 * d0_volume
         and d1_high > d1_close
         and prices_equal(d2_high, d1_close)
         and prices_equal(d2_low, d1_open)
